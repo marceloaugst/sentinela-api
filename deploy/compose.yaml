@@ -1,0 +1,77 @@
+name: sentinela
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sentinela
+      POSTGRES_USER: sentinela
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Sem "ports": o banco só é acessível pela rede interna do compose.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinela -d sentinela"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      HTTP_ADDR: ":8080"
+      DATABASE_URL: postgres://sentinela:${POSTGRES_PASSWORD}@postgres:5432/sentinela?sslmode=disable
+      AUTO_MIGRATE: ${AUTO_MIGRATE:-true}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      AGENT_HEARTBEAT_TIMEOUT_SECONDS: ${AGENT_HEARTBEAT_TIMEOUT_SECONDS:-60}
+      METRICS_RETENTION_DAYS: ${METRICS_RETENTION_DAYS:-30}
+      RETENTION_INTERVAL_MINUTES: ${RETENTION_INTERVAL_MINUTES:-60}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      AGENT_COLLECT_INTERVAL_SECONDS: ${AGENT_COLLECT_INTERVAL_SECONDS:-15}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      SECRETS_KEY: ${SECRETS_KEY:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_ALLOWED_CHAT_IDS: ${TELEGRAM_ALLOWED_CHAT_IDS:-}
+      SERVICE_CHECK_ALLOWED_CIDRS: ${SERVICE_CHECK_ALLOWED_CIDRS:-}
+      ALERT_EVALUATION_INTERVAL_SECONDS: ${ALERT_EVALUATION_INTERVAL_SECONDS:-15}
+      NOTIFICATION_MAX_ATTEMPTS: ${NOTIFICATION_MAX_ATTEMPTS:-8}
+      SSE_HEARTBEAT_SECONDS: ${SSE_HEARTBEAT_SECONDS:-15}
+      SSE_MAX_CLIENTS: ${SSE_MAX_CLIENTS:-500}
+      SSE_MAX_CLIENTS_PER_IP: ${SSE_MAX_CLIENTS_PER_IP:-20}
+      EVENTS_RETENTION_HOURS: ${EVENTS_RETENTION_HOURS:-24}
+      ADMIN_BOOTSTRAP_EMAIL: ${ADMIN_BOOTSTRAP_EMAIL:-}
+      ADMIN_BOOTSTRAP_NAME: ${ADMIN_BOOTSTRAP_NAME:-Administrador}
+      ADMIN_BOOTSTRAP_PASSWORD: ${ADMIN_BOOTSTRAP_PASSWORD:-}
+      SESSION_ABSOLUTE_HOURS: ${SESSION_ABSOLUTE_HOURS:-24}
+      SESSION_IDLE_MINUTES: ${SESSION_IDLE_MINUTES:-120}
+      COOKIE_SECURE: ${COOKIE_SECURE:-}
+      COOKIE_SAMESITE: ${COOKIE_SAMESITE:-lax}
+      LOGIN_MAX_FAILURES: ${LOGIN_MAX_FAILURES:-5}
+      LOGIN_LOCK_MINUTES: ${LOGIN_LOCK_MINUTES:-15}
+      ARGON2_MEMORY_KIB: ${ARGON2_MEMORY_KIB:-65536}
+      ARGON2_TIME: ${ARGON2_TIME:-3}
+      ARGON2_THREADS: ${ARGON2_THREADS:-2}
+      API_RATE_LIMIT_PER_SECOND: ${API_RATE_LIMIT_PER_SECOND:-30}
+      API_RATE_LIMIT_BURST: ${API_RATE_LIMIT_BURST:-100}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
+    ports:
+      # Publicado apenas em loopback; exponha ao público via proxy reverso (Nginx) com HTTPS.
+      - "127.0.0.1:${API_HOST_PORT:-8080}:8080"
+
+  redis:
+    image: redis:7-alpine
+    profiles: ["redis"] # opcional: docker compose --profile redis up
+    restart: unless-stopped
+
+volumes:
+  pgdata:

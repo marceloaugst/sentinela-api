@@ -1,0 +1,2308 @@
+openapi: 3.0.3
+info:
+  title: Sentinela API
+  version: 0.6.0
+  description: |
+    Fase 6 — API completa com autenticação por sessão, papéis (viewer < operator < admin), CSRF, auditoria e eventos em tempo real (SSE).
+    Somente endpoints implementados e testados estão documentados (um teste compara este arquivo com o router).
+
+    **Autenticação:** usuários entram por `POST /api/v1/auth/login` (sessão em cookie `HttpOnly` + cabeçalho `X-CSRF-Token` nas escritas).
+    Cada rota exige um papel mínimo (`x-required-role`). `ADMIN_API_KEY` é só uma credencial de automação opcional.
+    Os endpoints de agente exigem o token individual do agente (`snt_...`).
+servers:
+  - url: http://127.0.0.1:8080
+tags:
+  - name: ops
+  - name: servers
+  - name: agent-credentials
+  - name: agent
+  - name: metrics
+  - name: dashboard
+  - name: services
+  - name: alerts
+  - name: incidents
+  - name: notifications
+  - name: events
+  - name: auth
+  - name: users
+paths:
+  /healthz:
+    get:
+      tags: [ops]
+      summary: Liveness
+      operationId: healthz
+      responses:
+        "200":
+          description: Processo ativo
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      status: { type: string, example: ok }
+                      version: { type: string, example: dev }
+  /readyz:
+    get:
+      tags: [ops]
+      summary: Readiness (verifica o PostgreSQL)
+      operationId: readyz
+      responses:
+        "200":
+          description: Pronto
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      status: { type: string, example: ready }
+                      database: { type: string, example: ok }
+        "503":
+          description: Dependência indisponível
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /metrics:
+    get:
+      tags: [ops]
+      summary: Métricas Prometheus da própria API
+      description: Formato texto do Prometheus (fora do envelope). Restrinja o acesso no proxy reverso.
+      operationId: metrics
+      responses:
+        "200":
+          description: Métricas
+          content:
+            text/plain: { schema: { type: string } }
+
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Login (cria a sessão)
+      description: |
+        Valida e-mail e senha e cria uma **sessão** (cookie `HttpOnly`). A resposta traz o `csrf_token` que o frontend deve enviar
+        no cabeçalho `X-CSRF-Token` em toda requisição que altera estado (POST/PATCH/DELETE).
+
+        Toda falha de credencial (senha errada, e-mail inexistente, conta desativada) devolve a **mesma** resposta `401 INVALID_CREDENTIALS`
+        e leva o mesmo tempo (sem enumeração de contas). **Bloqueio** (429 `LOGIN_LOCKED`, com `Retry-After`): 5 falhas do mesmo e-mail a partir do
+        mesmo IP, 20 falhas de um IP, ou 30 falhas do mesmo e-mail em IPs diferentes, dentro de 15 min; o bloqueio é checado **antes** da senha e se
+        desfaz sozinho. Um atacante em outro IP não consegue trancar o usuário legítimo. Endpoint com limite de taxa próprio (429 `RATE_LIMITED`).
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, maxLength: 1024 }
+      responses:
+        "200":
+          description: Autenticado. Define o cookie de sessão.
+          headers:
+            Set-Cookie: { schema: { type: string }, description: "sentinela_session (ou __Host-sentinela_session com COOKIE_SECURE); HttpOnly; SameSite; Path=/" }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/SessionInfo" }
+        "401": { description: Credenciais inválidas (INVALID_CREDENTIALS), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "413": { description: Corpo acima de 8 KiB, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { $ref: "#/components/responses/Validation" }
+        "429": { description: LOGIN_LOCKED (tentativas demais) ou RATE_LIMITED; veja Retry-After, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: Encerra a sessão atual
+      operationId: logout
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "204": { description: Sessão revogada e cookie removido }
+  /api/v1/auth/logout-all:
+    post:
+      tags: [auth]
+      summary: Encerra todas as sessões do usuário (todos os dispositivos)
+      operationId: logoutAll
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "204": { description: Todas as sessões revogadas }
+        "400": { description: Chamado com a chave de API (não há sessão), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /api/v1/auth/me:
+    get:
+      tags: [auth]
+      summary: Usuário autenticado e token CSRF
+      description: "Reemite o `csrf_token` (derivado da sessão), útil após recarregar a página. Com a chave de API devolve `via` igual a `api_key` e nenhum token CSRF."
+      operationId: me
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Sessão atual
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/SessionInfo" }
+  /api/v1/auth/change-password:
+    post:
+      tags: [auth]
+      summary: Troca a própria senha
+      description: |
+        Exige a senha atual (cada erro conta para o bloqueio de login). Aplica a política de senhas (12–128 caracteres, sem senhas comuns, sem
+        conter e-mail ou nome). **Revoga todas as sessões** e devolve uma sessão nova para este dispositivo (novo cookie e novo `csrf_token`).
+      operationId: changePassword
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string }
+                new_password: { type: string, minLength: 12, maxLength: 128 }
+      responses:
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "200":
+          description: Senha trocada; cookie rotacionado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      csrf_token: { type: string }
+                      expires_at: { type: string, format: date-time }
+                      idle_expires_at: { type: string, format: date-time }
+        "400": { description: Chamado com a chave de API (NOT_A_SESSION), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { $ref: "#/components/responses/Validation" }
+        "429": { description: LOGIN_LOCKED, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /api/v1/users:
+    get:
+      tags: [users]
+      summary: Lista usuários
+      operationId: listUsers
+      x-required-role: admin
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: per_page, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: q, in: query, description: Busca por nome ou e-mail, schema: { type: string } }
+        - { name: role, in: query, schema: { $ref: "#/components/schemas/UserRole" } }
+        - { name: is_active, in: query, schema: { type: boolean } }
+      responses:
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Página de usuários
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/User" } }
+                  meta: { $ref: "#/components/schemas/PageMeta" }
+        "422": { $ref: "#/components/responses/Validation" }
+    post:
+      tags: [users]
+      summary: Cria um usuário
+      description: Não há cadastro público. A senha segue a política (12–128 caracteres...) e é guardada com Argon2id; nunca é devolvida.
+      operationId: createUser
+      x-required-role: admin
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, role, password]
+              properties:
+                name: { type: string, maxLength: 120 }
+                email: { type: string, format: email }
+                role: { $ref: "#/components/schemas/UserRole" }
+                password: { type: string, minLength: 12, maxLength: 128 }
+      responses:
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "201":
+          description: Criado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/User" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Validation" }
+  /api/v1/users/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [users]
+      summary: Detalhe do usuário
+      operationId: getUser
+      x-required-role: admin
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Usuário
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/User" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+    patch:
+      tags: [users]
+      summary: Altera nome, e-mail, papel, estado ou redefine a senha
+      description: |
+        Desativar (`is_active: false`) ou redefinir a senha **revoga todas as sessões** do usuário imediatamente (`meta.revoked_sessions`).
+        Mudanças de papel valem na próxima requisição. O **último administrador ativo** não pode ser desativado nem rebaixado (409 `LAST_ADMIN`).
+      operationId: updateUser
+      x-required-role: admin
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                name: { type: string }
+                email: { type: string, format: email }
+                role: { $ref: "#/components/schemas/UserRole" }
+                is_active: { type: boolean }
+                password: { type: string, minLength: 12, maxLength: 128 }
+      responses:
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Usuário atualizado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/User" }
+                  meta: { type: object, properties: { revoked_sessions: { type: integer } } }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "409": { description: E-mail em uso (CONFLICT) ou último administrador (LAST_ADMIN), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { $ref: "#/components/responses/Validation" }
+  /api/v1/users/{id}/sessions/revoke:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [users]
+      summary: Revoga todas as sessões de um usuário
+      operationId: revokeUserSessions
+      x-required-role: admin
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Sessões revogadas
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: object, properties: { revoked_sessions: { type: integer } } }
+        "400": { $ref: "#/components/responses/InvalidId" }
+  /api/v1/audit-logs:
+    get:
+      tags: [users]
+      summary: Trilha de auditoria (mais recentes primeiro)
+      description: |
+        Registra quem fez o quê: login, usuários, servidores, credenciais de agente, serviços, regras, canais, reconhecimento/resolução de alertas.
+        **Nunca** contém senhas, hashes, tokens de sessão/CSRF/agente nem tokens de bots. Retenção: `AUDIT_RETENTION_DAYS` (365).
+      operationId: listAuditLogs
+      x-required-role: admin
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: per_page, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: action, in: query, description: "Igualdade, ou prefixo quando termina com '.' (ex.: `user.`)", schema: { type: string } }
+        - { name: resource_type, in: query, schema: { type: string } }
+        - { name: resource_id, in: query, schema: { type: string } }
+        - { name: actor_user_id, in: query, schema: { type: string, format: uuid } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+      responses:
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Página de registros
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/AuditEntry" } }
+                  meta: { $ref: "#/components/schemas/PageMeta" }
+        "422": { $ref: "#/components/responses/Validation" }
+
+  /api/v1/servers:
+    get:
+      tags: [servers]
+      summary: Lista servidores
+      operationId: listServers
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: per_page, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: q, in: query, description: Busca por nome ou hostname (parcial, sem diferenciar maiúsculas), schema: { type: string, maxLength: 120 } }
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/AdminStatus" } }
+        - { name: connection, in: query, schema: { $ref: "#/components/schemas/ConnectionStatus" } }
+        - { name: sort, in: query, schema: { type: string, enum: [name, hostname, status, created_at, last_seen_at], default: name } }
+        - { name: order, in: query, schema: { type: string, enum: [asc, desc], default: asc } }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Página de servidores
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Server" } }
+                  meta: { $ref: "#/components/schemas/PageMeta" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Validation" }
+    post:
+      tags: [servers]
+      summary: Cadastra um servidor
+      operationId: createServer
+      x-required-role: admin
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, hostname]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 120 }
+                hostname: { type: string, maxLength: 253, description: Nome de host ou IP, sem esquema/porta }
+            example: { name: web-1, hostname: web-1.example.com }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "201":
+          description: Criado (cabeçalho Location aponta para o recurso)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ServerEnvelope" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Validation" }
+  /api/v1/servers/{id}:
+    parameters:
+      - { $ref: "#/components/parameters/ServerId" }
+    get:
+      tags: [servers]
+      summary: Detalhe do servidor
+      operationId: getServer
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Servidor
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ServerEnvelope" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [servers]
+      summary: Atualiza nome, hostname ou estado administrativo
+      operationId: updateServer
+      x-required-role: admin
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                name: { type: string }
+                hostname: { type: string }
+                status: { $ref: "#/components/schemas/AdminStatus" }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Servidor atualizado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ServerEnvelope" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Validation" }
+    delete:
+      tags: [servers]
+      summary: Remove o servidor (exclusão lógica)
+      description: |
+        O histórico (métricas, alertas, incidentes) é preservado, as credenciais do agente são
+        revogadas e o nome fica disponível para reutilização.
+      operationId: deleteServer
+      x-required-role: admin
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "204": { description: Removido }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/servers/{id}/disks:
+    parameters:
+      - { $ref: "#/components/parameters/ServerId" }
+    get:
+      tags: [servers]
+      summary: Volumes do servidor (última coleta, um por ponto de montagem)
+      operationId: listServerDisks
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Volumes
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Disk" } }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/servers/{id}/agent-credentials:
+    parameters:
+      - { $ref: "#/components/parameters/ServerId" }
+    get:
+      tags: [agent-credentials]
+      summary: Lista credenciais do servidor (sem token)
+      operationId: listAgentCredentials
+      x-required-role: admin
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Credenciais
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Credential" } }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [agent-credentials]
+      summary: Emite uma credencial de agente
+      description: |
+        O token completo é devolvido **apenas nesta resposta** (`Cache-Control: no-store`);
+        o banco guarda somente o hash SHA-256. Com `replace=true` as credenciais ativas
+        anteriores são revogadas na mesma transação.
+      operationId: issueAgentCredential
+      x-required-role: admin
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expires_in_days: { type: integer, minimum: 1, maximum: 3650, description: Sem valor = não expira }
+                replace: { type: boolean, default: false }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "201":
+          description: Credencial emitida
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: "#/components/schemas/IssuedCredential" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Validation" }
+  /api/v1/servers/{id}/agent-credentials/{credentialId}:
+    parameters:
+      - { $ref: "#/components/parameters/ServerId" }
+      - { name: credentialId, in: path, required: true, schema: { type: string, format: uuid } }
+    delete:
+      tags: [agent-credentials]
+      summary: Revoga uma credencial
+      operationId: revokeAgentCredential
+      x-required-role: admin
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "204": { description: Revogada }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/servers/{id}/summary:
+    parameters:
+      - { $ref: "#/components/parameters/ServerId" }
+    get:
+      tags: [metrics]
+      summary: Resumo do servidor (última amostra, discos, alertas, serviços, disponibilidade)
+      description: |
+        `latest.network` é a taxa entre as duas últimas amostras e fica nula quando o par não é
+        confiável (reset de contador, lacuna > 10 min ou sem dados). `availability` considera a janela
+        de 24 h (ou desde o cadastro, se mais recente): cada amostra mantém o servidor online por até
+        `AGENT_HEARTBEAT_TIMEOUT_SECONDS`, usando o horário de recebimento. `percent` é nulo se a janela tiver menos de 1 minuto.
+      operationId: getServerSummary
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Resumo
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/ServerSummary" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/servers/{id}/metrics:
+    parameters:
+      - { $ref: "#/components/parameters/ServerId" }
+    get:
+      tags: [metrics]
+      summary: Histórico de métricas do servidor
+      description: |
+        Período `[from, to)`; padrão: última hora. Sem `interval`, usa amostras originais (`raw`) para
+        períodos de até 1 h e, acima disso, o menor balde que mantém no máximo 1000 pontos. Máximo de 90 dias.
+        Cada métrica traz `min/avg/max` (em `raw` os três são iguais). Baldes sem amostras são omitidos.
+        Taxas de rede são calculadas entre amostras consecutivas e descartam resets de contador e lacunas > 10 min.
+      operationId: getServerMetrics
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: interval, in: query, schema: { type: string, enum: [raw, 1m, 5m, 15m, 1h, 6h, 1d] } }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Série temporal
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/MetricPoint" } }
+                  meta: { $ref: "#/components/schemas/SeriesMeta" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Validation" }
+  /api/v1/dashboard/summary:
+    get:
+      tags: [dashboard]
+      summary: Resumo agregado do painel
+      description: |
+        Recursos consideram apenas servidores **online**, usando a última amostra de cada um.
+        Memória e disco: Σ usado / Σ total (nunca média simples de percentuais). CPU: média ponderada pelo
+        número de CPUs lógicas, máximo e distribuição (low < 50%, medium 50–80%, high ≥ 80%).
+        Alertas e incidentes de servidores removidos não contam.
+      operationId: getDashboardSummary
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Resumo
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/DashboardSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/v1/dashboard/metrics:
+    get:
+      tags: [dashboard]
+      summary: Série agregada de vários servidores
+      description: |
+        Mesmas regras de período de `/servers/{id}/metrics`, exceto que `raw` não é aceito (mínimo 1m).
+        Memória do balde = Σ usado / Σ total das amostras do balde.
+      operationId: getDashboardMetrics
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: interval, in: query, schema: { type: string, enum: [1m, 5m, 15m, 1h, 6h, 1d] } }
+        - name: server_id
+          in: query
+          description: Restringe a servidores (UUIDs; repetido ou separado por vírgula; máx. 50). Omitido = todos.
+          schema: { type: array, items: { type: string, format: uuid } }
+          style: form
+          explode: true
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Série agregada
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/AggregatedPoint" } }
+                  meta: { $ref: "#/components/schemas/SeriesMeta" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Validation" }
+  /api/v1/dashboard/recent-alerts:
+    get:
+      tags: [dashboard]
+      summary: Alertas recentes (mais novos primeiro)
+      operationId: getRecentAlerts
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 10 } }
+        - { name: status, in: query, schema: { type: string, enum: [active, pending, firing, acknowledged, resolved] }, description: "`active` = não resolvidos" }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Alertas
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/RecentAlert" } }
+                  meta: { type: object, properties: { limit: { type: integer } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Validation" }
+  /api/v1/dashboard/recent-incidents:
+    get:
+      tags: [dashboard]
+      summary: Incidentes recentes (mais novos primeiro)
+      operationId: getRecentIncidents
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 10 } }
+        - { name: status, in: query, schema: { type: string, enum: [open, resolved] } }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Incidentes (`duration_seconds` de incidente aberto é o tempo decorrido até agora)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/RecentIncident" } }
+                  meta: { type: object, properties: { limit: { type: integer } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Validation" }
+
+  /api/v1/servers/{id}/services:
+    parameters:
+      - { $ref: "#/components/parameters/ServerId" }
+    get:
+      tags: [services]
+      summary: Serviços do servidor
+      operationId: listServerServices
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Página de serviços
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Service" } }
+                  meta: { $ref: "#/components/schemas/PageMeta" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Validation" }
+  /api/v1/servers/{id}/incidents:
+    parameters:
+      - { $ref: "#/components/parameters/ServerId" }
+    get:
+      tags: [incidents]
+      summary: Incidentes do servidor
+      operationId: listServerIncidents
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: per_page, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: status, in: query, schema: { type: string, enum: [open, resolved] } }
+        - { name: severity, in: query, schema: { type: string, enum: [info, warning, critical] } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Página de incidentes
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Incident" } }
+                  meta: { $ref: "#/components/schemas/PageMeta" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Validation" }
+
+  /api/v1/services:
+    get:
+      tags: [services]
+      summary: Lista serviços monitorados
+      operationId: listServices
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: per_page, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: q, in: query, description: Busca por nome ou alvo, schema: { type: string, maxLength: 120 } }
+        - { name: server_id, in: query, schema: { type: string, format: uuid } }
+        - { name: status, in: query, schema: { type: string, enum: [up, down, degraded, unknown] } }
+        - { name: service_type, in: query, schema: { type: string, enum: [http, tcp, systemd] } }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Página de serviços
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Service" } }
+                  meta: { $ref: "#/components/schemas/PageMeta" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Validation" }
+    post:
+      tags: [services]
+      summary: Cadastra um serviço monitorado
+      description: |
+        - `http`: verificado **pela API**. O alvo passa por proteção anti-SSRF (só http/https, sem credenciais na URL,
+          sem localhost/IP privado/link-local/metadados; checado de novo no momento da conexão). Redirecionamentos não são seguidos.
+        - `tcp`: verificado **pelo agente**, somente em loopback (`127.0.0.1:porta`).
+        - `systemd`: verificado **pelo agente**, sem executar comandos (cgroup v2).
+        Padrões: `timeout_seconds` 10 (http) ou 3, `interval_seconds` 60; o timeout padrão se ajusta a intervalos curtos.
+      operationId: createService
+      x-required-role: operator
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateService" }
+            example: { server_id: "00000000-0000-0000-0000-000000000001", name: api, service_type: http, target: "https://api.example.com/health", config: { interval_seconds: 30, expected_status: [200], body_contains: '"db":"up"', max_latency_ms: 800 } }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "201":
+          description: Criado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Service" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Validation" }
+  /api/v1/services/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [services]
+      summary: Detalhe do serviço
+      operationId: getService
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Serviço
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Service" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [services]
+      summary: Altera nome, alvo ou configuração (o tipo e o servidor não mudam)
+      operationId: updateService
+      x-required-role: operator
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                name: { type: string }
+                target: { type: string }
+                config: { $ref: "#/components/schemas/ServiceConfig" }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Serviço atualizado (reverificado em seguida)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Service" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Validation" }
+    delete:
+      tags: [services]
+      summary: Remove o serviço (exclusão lógica)
+      operationId: deleteService
+      x-required-role: operator
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "204": { description: Removido }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/services/{id}/check:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [services]
+      summary: Executa agora a verificação de um serviço http
+      description: Serviços `tcp` e `systemd` são verificados pelo agente no próprio intervalo e respondem 409 `CHECK_NOT_CENTRAL`.
+      operationId: checkService
+      x-required-role: operator
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Resultado e serviço atualizado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      service: { $ref: "#/components/schemas/Service" }
+                      result:
+                        type: object
+                        properties:
+                          status: { type: string, enum: [up, down, degraded] }
+                          latency_ms: { type: integer, nullable: true }
+                          status_code: { type: integer, nullable: true }
+                          error: { type: string, nullable: true, description: Categoria genérica; nunca expõe endereços internos }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/alert-rules:
+    get:
+      tags: [alerts]
+      summary: Lista regras de alerta
+      operationId: listAlertRules
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: per_page, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: metric_name, in: query, schema: { $ref: "#/components/schemas/MetricName" } }
+        - { name: severity, in: query, schema: { $ref: "#/components/schemas/Severity" } }
+        - { name: server_id, in: query, schema: { type: string, format: uuid } }
+        - { name: enabled, in: query, schema: { type: boolean } }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Página de regras
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/AlertRule" } }
+                  meta: { $ref: "#/components/schemas/PageMeta" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Validation" }
+    post:
+      tags: [alerts]
+      summary: Cria uma regra de alerta
+      description: |
+        `duration_seconds`: tempo mínimo em que a condição deve persistir antes de abrir o alerta (0 = imediato).
+        `recovery_seconds`: tempo mínimo com a condição normalizada antes de resolver (0 = imediato).
+        `server_id` omitido = regra global (todos os servidores ativos).
+        Métricas: `cpu_usage_percent`, `memory_used_percent`, `disk_used_percent` (pior volume), `load_average_1m`,
+        `server_offline` (segundos sem comunicação; operador `>` ou `>=`) e `service_down` (operador `==`, limiar `1`).
+        Não há regras pré-criadas: os exemplos do projeto (CPU > 90%, RAM > 90%, disco > 85%...) precisam ser cadastrados.
+      operationId: createAlertRule
+      x-required-role: operator
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateAlertRule" }
+            example: { name: CPU alta, metric_name: cpu_usage_percent, operator: ">", threshold: 90, severity: critical, duration_seconds: 120, recovery_seconds: 60 }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "201":
+          description: Criada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/AlertRule" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Validation" }
+  /api/v1/alert-rules/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [alerts]
+      summary: Detalhe da regra
+      operationId: getAlertRule
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Regra
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/AlertRule" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [alerts]
+      summary: Altera a regra (o conjunto resultante é revalidado)
+      description: Desativar a regra resolve seus alertas ativos (motivo `rule_disabled`) no próximo ciclo de avaliação.
+      operationId: updateAlertRule
+      x-required-role: operator
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateAlertRule" }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Regra atualizada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/AlertRule" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Validation" }
+    delete:
+      tags: [alerts]
+      summary: Remove a regra (exclusão lógica; o histórico de alertas permanece)
+      operationId: deleteAlertRule
+      x-required-role: operator
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "204": { description: Removida }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/alerts:
+    get:
+      tags: [alerts]
+      summary: Lista alertas (mais recentes primeiro)
+      description: Alertas `pending` (condição verdadeira, ainda dentro de `duration_seconds`) ainda não são alertas e não aparecem.
+      operationId: listAlerts
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: per_page, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: status, in: query, schema: { type: string, enum: [active, firing, acknowledged, resolved] }, description: "`active` = firing + acknowledged" }
+        - { name: severity, in: query, schema: { $ref: "#/components/schemas/Severity" } }
+        - { name: server_id, in: query, schema: { type: string, format: uuid } }
+        - { name: rule_id, in: query, schema: { type: string, format: uuid } }
+        - { name: from, in: query, description: Início (triggered_at >=), schema: { type: string, format: date-time } }
+        - { name: to, in: query, description: Fim (triggered_at <), schema: { type: string, format: date-time } }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Página de alertas
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Alert" } }
+                  meta: { $ref: "#/components/schemas/PageMeta" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Validation" }
+  /api/v1/alerts/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [alerts]
+      summary: Detalhe do alerta
+      operationId: getAlert
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Alerta
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Alert" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/alerts/{id}/acknowledge:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [alerts]
+      summary: Reconhece o alerta (idempotente)
+      description: Registra um evento no incidente. Enquanto a autenticação de usuários não existe (Fase 6), o autor é a chave administrativa.
+      operationId: acknowledgeAlert
+      x-required-role: operator
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, properties: { note: { type: string, maxLength: 500 } } }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Alerta reconhecido
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Alert" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Alerta já resolvido (INVALID_STATE), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { $ref: "#/components/responses/Validation" }
+  /api/v1/alerts/{id}/resolve:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [alerts]
+      summary: Resolve o alerta manualmente (e fecha o incidente)
+      description: Se a condição ainda existir, o avaliador abrirá um novo alerta quando voltar a avaliá-la como verdadeira (respeitando `duration_seconds`).
+      operationId: resolveAlert
+      x-required-role: operator
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Alerta resolvido
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Alert" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Alerta já resolvido (INVALID_STATE), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /api/v1/incidents:
+    get:
+      tags: [incidents]
+      summary: Lista incidentes (mais recentes primeiro)
+      operationId: listIncidents
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: per_page, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: status, in: query, schema: { type: string, enum: [open, resolved] } }
+        - { name: severity, in: query, schema: { $ref: "#/components/schemas/Severity" } }
+        - { name: server_id, in: query, schema: { type: string, format: uuid } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Página de incidentes
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Incident" } }
+                  meta: { $ref: "#/components/schemas/PageMeta" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Validation" }
+  /api/v1/incidents/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [incidents]
+      summary: Detalhe do incidente com seus alertas
+      operationId: getIncident
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Incidente
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/IncidentDetail" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/incidents/{id}/events:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [incidents]
+      summary: Linha do tempo do incidente (ordem cronológica)
+      operationId: listIncidentEvents
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Eventos (opened, alert_triggered, acknowledged, alert_resolved, resolved)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/IncidentEvent" } }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/notification-channels:
+    get:
+      tags: [notifications]
+      summary: Lista canais de notificação (nunca devolve o token)
+      operationId: listNotificationChannels
+      x-required-role: admin
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Canais
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/NotificationChannel" } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [notifications]
+      summary: Cadastra um canal Telegram
+      description: |
+        O `bot_token` é cifrado (AES-256-GCM) com `SECRETS_KEY` e nunca mais é exibido. O `chat_id` precisa estar em
+        `TELEGRAM_ALLOWED_CHAT_IDS` (ou ser o `TELEGRAM_CHAT_ID`); sem destinos autorizados nada é aceito.
+        Sem `SECRETS_KEY` a resposta é 503 `SECRETS_NOT_CONFIGURED`.
+        Entrega: fila persistente com retentativas e backoff exponencial; recuperação só é enviada a quem recebeu o disparo.
+      operationId: createNotificationChannel
+      x-required-role: admin
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateChannel" }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "201":
+          description: Criado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/NotificationChannel" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Validation" }
+        "503": { description: SECRETS_KEY não configurada, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /api/v1/notification-channels/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [notifications]
+      summary: Detalhe do canal
+      operationId: getNotificationChannel
+      x-required-role: admin
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Canal
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/NotificationChannel" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [notifications]
+      summary: Altera o canal (inclusive trocar o token)
+      operationId: updateNotificationChannel
+      x-required-role: admin
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                name: { type: string }
+                bot_token: { type: string }
+                chat_id: { type: string }
+                min_severity: { $ref: "#/components/schemas/Severity" }
+                is_enabled: { type: boolean }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Canal atualizado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/NotificationChannel" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Validation" }
+        "503": { description: SECRETS_KEY não configurada, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    delete:
+      tags: [notifications]
+      summary: Remove o canal e suas mensagens pendentes
+      operationId: deleteNotificationChannel
+      x-required-role: admin
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "204": { description: Removido }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/notification-channels/{id}/test:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [notifications]
+      summary: Enfileira uma mensagem de teste
+      operationId: testNotificationChannel
+      x-required-role: admin
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "202":
+          description: Enfileirada (entregue pelo worker em segundos)
+          content:
+            application/json:
+              schema: { type: object, properties: { data: { type: object, properties: { queued: { type: boolean } } } } }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/events:
+    get:
+      tags: [events]
+      summary: Stream de eventos em tempo real (Server-Sent Events)
+      description: |
+        Resposta `text/event-stream`, **fora do envelope** `{data, meta}` e **sem timeout de requisição**.
+        Cada mensagem tem o formato:
+
+        ```
+        id: 123
+        event: alert.triggered
+        data: {"id":123,"type":"alert.triggered","time":"2026-03-01T12:00:00Z","data":{...}}
+        ```
+
+        **Tipos.** `server.status_changed`, `alert.triggered`, `alert.acknowledged`, `alert.resolved`, `incident.created`,
+        `incident.resolved`, `service.status_changed` (duráveis, com `id`) e `metrics.updated` (efêmero, sem `id`, **opt-in**:
+        precisa constar em `types`; no máximo 1 a cada 5 s por servidor). O tipo sintético `resync` diz ao cliente para recarregar
+        o estado pela API (`reason`: `gap`, `ahead`, `too_many`, `overflow`, `error`).
+
+        **Reconexão.** Eventos duráveis têm `id` crescente em ordem de confirmação. Ao reconectar, envie `Last-Event-ID` (o
+        `EventSource` faz isso sozinho) ou `?last_event_id=`: o servidor reenvia o que faltou, em ordem e sem duplicar, e segue
+        ao vivo. Se o histórico não estiver mais disponível (retenção de `EVENTS_RETENTION_HOURS`, padrão 24 h), ou forem
+        eventos demais (> 1000), ou o id for de outro histórico, o servidor envia `resync`. Sem `Last-Event-ID` só chegam eventos novos.
+
+        **Mantém-se aberto** com comentários `: ping` a cada `SSE_HEARTBEAT_SECONDS` (padrão 15 s). `retry: 5000` sugere 5 s de espera
+        antes de reconectar. Um cliente que não acompanha o ritmo recebe `resync` (`overflow`) e é desconectado.
+
+        **Autorização.** Sessão de usuário (cookie), qualquer papel. O `EventSource` nativo funciona com `withCredentials: true`; clientes
+        baseados em `fetch` também podem usar `Authorization: Bearer <ADMIN_API_KEY>`. A chave **não** é aceita na URL (vazaria em logs).
+        Todos os usuários autenticados verão os mesmos eventos; os payloads não contêm segredos, URLs/alvos, hostnames, tokens nem notas de operadores.
+
+        **Limites.** `SSE_MAX_CLIENTS` (500) e `SSE_MAX_CLIENTS_PER_IP` (20): 503 `STREAM_UNAVAILABLE` / 429 `TOO_MANY_STREAMS`.
+        Atrás de Nginx: `proxy_buffering off;` e `proxy_read_timeout` maior que o heartbeat.
+      operationId: streamEvents
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - name: types
+          in: query
+          description: "Lista (vírgulas) de tipos desejados. Padrão: todos os duráveis (sem metrics.updated)."
+          schema: { type: string, example: "alert.triggered,service.status_changed" }
+        - { name: server_id, in: query, description: Só eventos deste servidor, schema: { type: string, format: uuid } }
+        - { name: last_event_id, in: query, description: Equivale ao cabeçalho Last-Event-ID (o cabeçalho tem precedência), schema: { type: integer, minimum: 0 } }
+        - { name: Last-Event-ID, in: header, schema: { type: integer, minimum: 0 } }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "200":
+          description: Stream aberto
+          content:
+            text/event-stream:
+              schema: { type: string }
+              example: "retry: 5000\n: connected\n\nid: 7\nevent: alert.triggered\ndata: {\"id\":7,\"type\":\"alert.triggered\",\"time\":\"2026-03-01T12:00:00Z\",\"data\":{\"alert_id\":\"...\",\"severity\":\"critical\"}}\n\n"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Validation" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { description: Limite de conexões ou servidor encerrando (STREAM_UNAVAILABLE), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /api/v1/agent/heartbeat:
+    post:
+      tags: [agent]
+      summary: Sinal de presença e inventário
+      description: O servidor é sempre o associado à credencial; identificadores de servidor no corpo são rejeitados.
+      operationId: agentHeartbeat
+      security: [{ agentToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Heartbeat" }
+      responses:
+        "200":
+          description: Registrado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      server_time: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ServerDisabled" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "422": { $ref: "#/components/responses/Validation" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v1/agent/metrics:
+    post:
+      tags: [agent]
+      summary: Envia uma amostra de métricas
+      description: |
+        Idempotente por (servidor, `collected_at`): reenviar a mesma amostra devolve 200 com
+        `duplicate: true` e não grava de novo. `collected_at` deve estar entre 1 hora no passado
+        e 2 minutos no futuro, em relação ao horário de recebimento. Contadores de rede são ACUMULADOS.
+        Memória usada = total − disponível.
+      operationId: agentMetrics
+      security: [{ agentToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MetricsPayload" }
+      responses:
+        "200":
+          description: Aceita
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      stored: { type: boolean }
+                      duplicate: { type: boolean }
+                      received_at: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ServerDisabled" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "422": { $ref: "#/components/responses/Validation" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v1/agent/services:
+    post:
+      tags: [agent]
+      summary: Resultados das verificações locais (tcp/systemd)
+      description: |
+        O agente só altera serviços do **próprio servidor** e apenas dos tipos verificados localmente. Itens recusados voltam em
+        `rejected` com `reason` `unknown_service` (inexistente, de outro servidor ou de tipo central) ou `stale` (resultado mais
+        antigo que o já gravado). `error` é sanitizado (sem caracteres de controle, máx. 200). Até 100 resultados por envio.
+      operationId: agentServices
+      security: [{ agentToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AgentServiceReport" }
+      responses:
+        "200":
+          description: Processado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      accepted: { type: integer }
+                      rejected:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            service_id: { type: string, format: uuid }
+                            reason: { type: string, enum: [unknown_service, stale] }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ServerDisabled" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "422": { $ref: "#/components/responses/Validation" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v1/agent/config:
+    get:
+      tags: [agent]
+      summary: Parâmetros operacionais do agente (sem segredos nem comandos)
+      operationId: agentConfig
+      security: [{ agentToken: [] }]
+      responses:
+        "200":
+          description: Configuração
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      collect_interval_seconds: { type: integer, example: 15 }
+                      heartbeat_timeout_seconds: { type: integer, example: 60 }
+                      max_payload_bytes: { type: integer, example: 65536 }
+                      max_disks: { type: integer, example: 64 }
+                      services:
+                        type: array
+                        description: Serviços tcp/systemd deste servidor (apenas nomes e tempos; nunca comandos)
+                        items: { $ref: "#/components/schemas/AgentService" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ServerDisabled" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+components:
+  securitySchemes:
+    sessionAuth:
+      type: apiKey
+      in: cookie
+      name: sentinela_session
+      description: |
+        Sessão de usuário (cookie `HttpOnly`; com `COOKIE_SECURE` o nome é `__Host-sentinela_session`). Obtida em `POST /auth/login`.
+        Requisições que alteram estado (POST/PATCH/DELETE) exigem o cabeçalho **`X-CSRF-Token`** com o `csrf_token` do login/`/auth/me`;
+        sem ele a resposta é 403 `CSRF_INVALID`. Se houver cabeçalho `Origin`, deve ser a própria API ou uma origem configurada
+        (`CORS_ALLOWED_ORIGINS`), senão 403 `ORIGIN_NOT_ALLOWED`. Sessões expiram por inatividade (`SESSION_IDLE_MINUTES`) e por prazo
+        absoluto (`SESSION_ABSOLUTE_HOURS`).
+    adminKey:
+      type: http
+      scheme: bearer
+      description: |
+        `ADMIN_API_KEY` — credencial de **automação** opcional (desativada quando a variável está vazia), papel `admin`, sem cookie e
+        sem CSRF. As ações aparecem na auditoria como `api_key`. Em produção prefira deixá-la vazia e usar usuários.
+    agentToken:
+      type: http
+      scheme: bearer
+      description: Token individual do agente (prefixo snt_)
+  parameters:
+    ServerId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    Forbidden:
+      description: "Papel insuficiente (FORBIDDEN), token CSRF ausente/inválido (CSRF_INVALID) ou origem não permitida (ORIGIN_NOT_ALLOWED)"
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Unauthorized:
+      description: Credencial ausente, inválida, expirada ou revogada
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    NotFound:
+      description: Recurso não encontrado
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    InvalidId:
+      description: Identificador inválido (INVALID_ID)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Conflict:
+      description: Nome já em uso (CONFLICT)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Validation:
+      description: Dados inválidos (VALIDATION_ERROR) com detalhes por campo
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error:
+              code: VALIDATION_ERROR
+              message: Os dados informados são inválidos.
+              details: [{ field: cpu.usage_percent, message: deve estar entre 0 e 100 }]
+    TooLarge:
+      description: Corpo acima do limite (PAYLOAD_TOO_LARGE)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    ServerDisabled:
+      description: Servidor desativado (SERVER_DISABLED)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    RateLimited:
+      description: Limite de requisições excedido (RATE_LIMITED); veja o cabeçalho Retry-After
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+  schemas:
+    AdminStatus:
+      type: string
+      enum: [active, maintenance, disabled]
+      description: Estado administrativo (definido pelo operador)
+    ConnectionStatus:
+      type: string
+      enum: [online, offline, unknown]
+      description: Calculado a partir de last_seen_at e AGENT_HEARTBEAT_TIMEOUT_SECONDS; `unknown` = nunca recebeu comunicação
+    Server:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        hostname: { type: string }
+        operating_system: { type: string, nullable: true }
+        operating_system_version: { type: string, nullable: true }
+        architecture: { type: string, nullable: true }
+        agent_version: { type: string, nullable: true }
+        status: { $ref: "#/components/schemas/AdminStatus" }
+        connection_status: { $ref: "#/components/schemas/ConnectionStatus" }
+        last_seen_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    ServerEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/Server" }
+    PageMeta:
+      type: object
+      properties:
+        page: { type: integer }
+        per_page: { type: integer }
+        total: { type: integer }
+        total_pages: { type: integer }
+    Disk:
+      type: object
+      properties:
+        mount_point: { type: string }
+        filesystem: { type: string, nullable: true }
+        total_bytes: { type: integer, format: int64 }
+        used_bytes: { type: integer, format: int64 }
+        available_bytes: { type: integer, format: int64 }
+        used_percent: { type: number }
+        collected_at: { type: string, format: date-time }
+    Credential:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        server_id: { type: string, format: uuid }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time, nullable: true }
+        revoked_at: { type: string, format: date-time, nullable: true }
+        last_used_at: { type: string, format: date-time, nullable: true }
+    IssuedCredential:
+      allOf:
+        - $ref: "#/components/schemas/Credential"
+        - type: object
+          properties:
+            token: { type: string, description: Exibido somente na emissão, example: snt_0123... }
+    Host:
+      type: object
+      properties:
+        hostname: { type: string, maxLength: 253 }
+        os: { type: string, maxLength: 100 }
+        os_version: { type: string, maxLength: 100 }
+        architecture: { type: string, maxLength: 32 }
+        uptime_seconds: { type: integer, format: int64, minimum: 0 }
+    Heartbeat:
+      type: object
+      required: [agent_version]
+      properties:
+        agent_version: { type: string, maxLength: 64 }
+        host: { $ref: "#/components/schemas/Host" }
+    MetricsPayload:
+      type: object
+      required: [agent_version, collected_at, cpu, memory]
+      properties:
+        agent_version: { type: string, maxLength: 64 }
+        collected_at: { type: string, format: date-time }
+        host: { $ref: "#/components/schemas/Host" }
+        cpu:
+          type: object
+          required: [usage_percent]
+          properties:
+            usage_percent: { type: number, minimum: 0, maximum: 100 }
+            count: { type: integer, minimum: 1, maximum: 4096 }
+            load_average:
+              type: object
+              properties:
+                m1: { type: number, minimum: 0 }
+                m5: { type: number, minimum: 0 }
+                m15: { type: number, minimum: 0 }
+        memory:
+          type: object
+          required: [total_bytes, used_bytes, available_bytes]
+          properties:
+            total_bytes: { type: integer, format: int64, minimum: 1 }
+            used_bytes: { type: integer, format: int64 }
+            available_bytes: { type: integer, format: int64 }
+            swap_total_bytes: { type: integer, format: int64 }
+            swap_used_bytes: { type: integer, format: int64 }
+        network:
+          type: object
+          description: Contadores acumulados desde o boot (não são taxas)
+          properties:
+            rx_bytes_total: { type: integer, format: int64 }
+            tx_bytes_total: { type: integer, format: int64 }
+        disks:
+          type: array
+          maxItems: 64
+          items:
+            type: object
+            required: [mount_point, total_bytes, used_bytes, available_bytes]
+            properties:
+              mount_point: { type: string, description: Caminho absoluto; sem duplicatas na mesma coleta }
+              filesystem: { type: string }
+              total_bytes: { type: integer, format: int64 }
+              used_bytes: { type: integer, format: int64 }
+              available_bytes: { type: integer, format: int64 }
+      example:
+        agent_version: 0.1.0
+        collected_at: "2026-03-01T12:00:00Z"
+        host: { hostname: web-1, os: Ubuntu, os_version: "24.04", architecture: amd64, uptime_seconds: 86400 }
+        cpu: { usage_percent: 12.5, count: 4, load_average: { m1: 0.1, m5: 0.2, m15: 0.3 } }
+        memory: { total_bytes: 8589934592, used_bytes: 2147483648, available_bytes: 6442450944, swap_total_bytes: 0, swap_used_bytes: 0 }
+        network: { rx_bytes_total: 123456789, tx_bytes_total: 987654321 }
+        disks: [{ mount_point: /, filesystem: ext4, total_bytes: 107374182400, used_bytes: 32212254720, available_bytes: 75161927680 }]
+    Stat:
+      type: object
+      description: "Mínimo, média e máximo no balde (nulos quando não há dado, por exemplo sem swap ou sem taxa válida)"
+      properties:
+        min: { type: number, nullable: true }
+        avg: { type: number, nullable: true }
+        max: { type: number, nullable: true }
+    SeriesMeta:
+      type: object
+      properties:
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        interval: { type: string, example: 5m }
+        bucket_seconds: { type: integer, description: 0 = amostras originais }
+        points: { type: integer }
+        max_points: { type: integer, example: 1000 }
+    MetricPoint:
+      type: object
+      properties:
+        t: { type: string, format: date-time, description: Início do balde (ou instante da amostra em raw) }
+        samples: { type: integer }
+        cpu_usage_percent: { $ref: "#/components/schemas/Stat" }
+        memory_used_percent: { $ref: "#/components/schemas/Stat" }
+        memory_used_bytes: { $ref: "#/components/schemas/Stat" }
+        load_average_1m: { $ref: "#/components/schemas/Stat" }
+        swap_used_percent: { $ref: "#/components/schemas/Stat" }
+        network_rx_bytes_per_sec: { $ref: "#/components/schemas/Stat" }
+        network_tx_bytes_per_sec: { $ref: "#/components/schemas/Stat" }
+    AggregatedPoint:
+      type: object
+      properties:
+        t: { type: string, format: date-time }
+        samples: { type: integer }
+        servers: { type: integer, description: Servidores distintos com dados no balde }
+        cpu_usage_percent: { $ref: "#/components/schemas/Stat" }
+        memory_used_percent: { type: number, nullable: true, description: Σ usado / Σ total }
+        load_average_1m: { $ref: "#/components/schemas/Stat" }
+    Capacity:
+      type: object
+      properties:
+        used_bytes: { type: integer, format: int64 }
+        total_bytes: { type: integer, format: int64 }
+        used_percent: { type: number, nullable: true }
+    AlertCounts:
+      type: object
+      properties:
+        active: { type: integer }
+        critical: { type: integer }
+        warning: { type: integer }
+        info: { type: integer }
+    DashboardSummary:
+      type: object
+      properties:
+        servers:
+          type: object
+          properties:
+            total: { type: integer }
+            online: { type: integer }
+            offline: { type: integer }
+            unknown: { type: integer }
+            maintenance: { type: integer }
+            disabled: { type: integer }
+            with_active_alerts: { type: integer }
+        alerts: { $ref: "#/components/schemas/AlertCounts" }
+        incidents: { type: object, properties: { open: { type: integer } } }
+        resources:
+          type: object
+          properties:
+            reporting_servers: { type: integer, description: Servidores online usados nos agregados }
+            cpu:
+              type: object
+              properties:
+                weighted_avg_percent: { type: number, nullable: true }
+                max_percent: { type: number, nullable: true }
+                top_server: { type: object, nullable: true, properties: { id: { type: string, format: uuid }, name: { type: string } } }
+                distribution: { type: object, properties: { low: { type: integer }, medium: { type: integer }, high: { type: integer } } }
+            memory: { $ref: "#/components/schemas/Capacity" }
+            disk: { $ref: "#/components/schemas/Capacity" }
+        data_as_of: { type: string, format: date-time, nullable: true, description: Recebimento mais recente entre as amostras usadas }
+        updated_at: { type: string, format: date-time }
+    ServerSummary:
+      type: object
+      properties:
+        server: { $ref: "#/components/schemas/Server" }
+        latest:
+          type: object
+          nullable: true
+          properties:
+            collected_at: { type: string, format: date-time }
+            received_at: { type: string, format: date-time }
+            cpu_usage_percent: { type: number }
+            cpu_count: { type: integer, nullable: true }
+            load_average: { type: object, properties: { m1: { type: number, nullable: true }, m5: { type: number, nullable: true }, m15: { type: number, nullable: true } } }
+            memory:
+              type: object
+              properties:
+                total_bytes: { type: integer, format: int64 }
+                used_bytes: { type: integer, format: int64 }
+                available_bytes: { type: integer, format: int64 }
+                used_percent: { type: number, nullable: true }
+                swap_total_bytes: { type: integer, format: int64 }
+                swap_used_bytes: { type: integer, format: int64 }
+            uptime_seconds: { type: integer, nullable: true }
+            network: { type: object, nullable: true, properties: { rx_bytes_per_sec: { type: number }, tx_bytes_per_sec: { type: number } } }
+        disks: { type: array, items: { $ref: "#/components/schemas/Disk" } }
+        alerts: { $ref: "#/components/schemas/AlertCounts" }
+        incidents: { type: object, properties: { open: { type: integer } } }
+        services:
+          type: object
+          properties:
+            total: { type: integer }
+            up: { type: integer }
+            down: { type: integer }
+            degraded: { type: integer }
+            unknown: { type: integer }
+        availability:
+          type: object
+          properties:
+            window_seconds: { type: integer }
+            percent: { type: number, nullable: true }
+    RecentAlert:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        server_id: { type: string, format: uuid }
+        server_name: { type: string }
+        rule_id: { type: string, format: uuid }
+        rule_name: { type: string }
+        severity: { type: string, enum: [info, warning, critical] }
+        status: { type: string, enum: [pending, firing, acknowledged, resolved] }
+        message: { type: string }
+        triggered_at: { type: string, format: date-time }
+        acknowledged_at: { type: string, format: date-time, nullable: true }
+        resolved_at: { type: string, format: date-time, nullable: true }
+    RecentIncident:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        server_id: { type: string, format: uuid, nullable: true }
+        server_name: { type: string, nullable: true }
+        title: { type: string }
+        severity: { type: string, enum: [info, warning, critical] }
+        status: { type: string, enum: [open, resolved] }
+        started_at: { type: string, format: date-time }
+        resolved_at: { type: string, format: date-time, nullable: true }
+        duration_seconds: { type: integer, format: int64 }
+    Severity: { type: string, enum: [info, warning, critical] }
+    MetricName: { type: string, enum: [cpu_usage_percent, memory_used_percent, disk_used_percent, load_average_1m, server_offline, service_down] }
+    ServiceConfig:
+      type: object
+      properties:
+        timeout_seconds: { type: integer, minimum: 1, maximum: 30, description: "Padrão 10 (http) ou 3; máx. 10 para tcp/systemd; sempre menor que o intervalo" }
+        interval_seconds: { type: integer, minimum: 10, maximum: 3600, default: 60 }
+        method: { type: string, enum: [GET, HEAD], description: Somente http }
+        expected_status: { type: array, items: { type: integer, minimum: 100, maximum: 599 }, maxItems: 20, description: "Somente http; padrão [200]" }
+        body_contains: { type: string, maxLength: 256, description: "Somente http (GET); lê até 64 KiB do corpo" }
+        max_latency_ms: { type: integer, minimum: 0, maximum: 60000, description: "Somente http; acima disso o estado é degraded" }
+    CreateService:
+      type: object
+      required: [server_id, name, service_type, target]
+      properties:
+        server_id: { type: string, format: uuid }
+        name: { type: string, minLength: 1, maxLength: 120 }
+        service_type: { type: string, enum: [http, tcp, systemd] }
+        target: { type: string, description: "http: URL; tcp: 127.0.0.1:porta; systemd: nome da unidade" }
+        config: { $ref: "#/components/schemas/ServiceConfig" }
+    Service:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        server_id: { type: string, format: uuid }
+        name: { type: string }
+        service_type: { type: string, enum: [http, tcp, systemd] }
+        target: { type: string }
+        config: { $ref: "#/components/schemas/ServiceConfig" }
+        status: { type: string, enum: [unknown, up, down, degraded] }
+        last_checked_at: { type: string, format: date-time, nullable: true }
+        last_error: { type: string, nullable: true }
+        last_latency_ms: { type: integer, nullable: true }
+        last_status_code: { type: integer, nullable: true }
+        consecutive_failures: { type: integer }
+        status_changed_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    AgentService:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        service_type: { type: string, enum: [tcp, systemd] }
+        target: { type: string }
+        timeout_seconds: { type: integer }
+        interval_seconds: { type: integer }
+    AgentServiceReport:
+      type: object
+      required: [checked_at, results]
+      properties:
+        checked_at: { type: string, format: date-time, description: Entre 1 h no passado e 2 min no futuro }
+        results:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            type: object
+            required: [service_id, status]
+            properties:
+              service_id: { type: string, format: uuid }
+              status: { type: string, enum: [up, down, degraded] }
+              latency_ms: { type: integer, minimum: 0, maximum: 600000, nullable: true }
+              error: { type: string, maxLength: 200 }
+    CreateAlertRule:
+      type: object
+      required: [name, metric_name, operator, threshold, severity]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        metric_name: { $ref: "#/components/schemas/MetricName" }
+        operator: { type: string, enum: [">", ">=", "<", "<=", "=="] }
+        threshold: { type: number }
+        severity: { $ref: "#/components/schemas/Severity" }
+        duration_seconds: { type: integer, minimum: 0, maximum: 86400, default: 0 }
+        recovery_seconds: { type: integer, minimum: 0, maximum: 86400, default: 0 }
+        server_id: { type: string, format: uuid, nullable: true, description: Omitido = global }
+        is_enabled: { type: boolean, default: true }
+    UpdateAlertRule:
+      type: object
+      minProperties: 1
+      properties:
+        name: { type: string }
+        metric_name: { $ref: "#/components/schemas/MetricName" }
+        operator: { type: string, enum: [">", ">=", "<", "<=", "=="] }
+        threshold: { type: number }
+        severity: { $ref: "#/components/schemas/Severity" }
+        duration_seconds: { type: integer }
+        recovery_seconds: { type: integer }
+        server_id: { type: string, format: uuid, description: "Não é possível voltar a global por PATCH; recrie a regra" }
+        is_enabled: { type: boolean }
+    AlertRule:
+      allOf:
+        - $ref: "#/components/schemas/CreateAlertRule"
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            created_at: { type: string, format: date-time }
+            updated_at: { type: string, format: date-time }
+    Alert:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        rule_id: { type: string, format: uuid }
+        rule_name: { type: string }
+        server_id: { type: string, format: uuid }
+        server_name: { type: string }
+        service_id: { type: string, format: uuid, nullable: true }
+        service_name: { type: string, nullable: true }
+        incident_id: { type: string, format: uuid, nullable: true }
+        status: { type: string, enum: [firing, acknowledged, resolved] }
+        severity: { $ref: "#/components/schemas/Severity" }
+        message: { type: string }
+        value: { type: number, nullable: true }
+        triggered_at: { type: string, format: date-time }
+        acknowledged_at: { type: string, format: date-time, nullable: true }
+        acknowledged_by: { type: string, format: uuid, nullable: true, description: Usuário (Fase 6); nulo enquanto o ator é a chave administrativa }
+        resolved_at: { type: string, format: date-time, nullable: true }
+        resolved_reason: { type: string, nullable: true, enum: [recovered, manual, rule_disabled, rule_deleted, out_of_scope] }
+        last_evaluated_at: { type: string, format: date-time }
+    Incident:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        server_id: { type: string, format: uuid, nullable: true }
+        server_name: { type: string, nullable: true }
+        rule_id: { type: string, format: uuid, nullable: true }
+        rule_name: { type: string, nullable: true }
+        service_id: { type: string, format: uuid, nullable: true }
+        service_name: { type: string, nullable: true }
+        title: { type: string }
+        severity: { $ref: "#/components/schemas/Severity" }
+        status: { type: string, enum: [open, resolved] }
+        started_at: { type: string, format: date-time }
+        resolved_at: { type: string, format: date-time, nullable: true }
+        duration_seconds: { type: integer, format: int64, description: Incidente aberto = tempo decorrido até agora }
+    IncidentDetail:
+      allOf:
+        - $ref: "#/components/schemas/Incident"
+        - type: object
+          properties:
+            alerts:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: string, format: uuid }
+                  status: { type: string }
+                  severity: { $ref: "#/components/schemas/Severity" }
+                  message: { type: string }
+                  triggered_at: { type: string, format: date-time }
+                  resolved_at: { type: string, format: date-time, nullable: true }
+    IncidentEvent:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        event_type: { type: string, enum: [opened, alert_triggered, acknowledged, alert_resolved, resolved] }
+        message: { type: string }
+        created_at: { type: string, format: date-time }
+    CreateChannel:
+      type: object
+      required: [name, bot_token, chat_id]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        channel_type: { type: string, enum: [telegram], default: telegram }
+        bot_token: { type: string, writeOnly: true, example: "123456789:AAH..." }
+        chat_id: { type: string, example: "-1001234567890" }
+        min_severity: { $ref: "#/components/schemas/Severity" }
+        is_enabled: { type: boolean, default: true }
+    NotificationChannel:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        channel_type: { type: string, enum: [telegram] }
+        chat_id: { type: string }
+        min_severity: { $ref: "#/components/schemas/Severity" }
+        is_enabled: { type: boolean }
+        has_token: { type: boolean, description: O token nunca é devolvido }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    EventEnvelope:
+      type: object
+      description: Conteúdo de `data:` de cada mensagem SSE
+      required: [type, time, data]
+      properties:
+        id: { type: integer, format: int64, description: Ausente nos eventos efêmeros (metrics.updated) }
+        type: { type: string, enum: [server.status_changed, metrics.updated, alert.triggered, alert.acknowledged, alert.resolved, incident.created, incident.resolved, service.status_changed, resync] }
+        time: { type: string, format: date-time }
+        data:
+          oneOf:
+            - $ref: "#/components/schemas/AlertEventData"
+            - $ref: "#/components/schemas/IncidentEventData"
+            - $ref: "#/components/schemas/ServiceStatusEventData"
+            - $ref: "#/components/schemas/ServerStatusEventData"
+            - $ref: "#/components/schemas/MetricsUpdatedEventData"
+            - $ref: "#/components/schemas/ResyncEventData"
+    AlertEventData:
+      type: object
+      description: alert.triggered / alert.acknowledged / alert.resolved
+      properties:
+        alert_id: { type: string, format: uuid }
+        incident_id: { type: string, format: uuid }
+        server_id: { type: string, format: uuid }
+        server_name: { type: string }
+        service_id: { type: string, format: uuid }
+        service_name: { type: string }
+        rule_id: { type: string, format: uuid }
+        rule_name: { type: string }
+        severity: { $ref: "#/components/schemas/Severity" }
+        status: { type: string, enum: [firing, acknowledged, resolved] }
+        message: { type: string }
+        at: { type: string, format: date-time }
+    IncidentEventData:
+      type: object
+      description: incident.created / incident.resolved
+      properties:
+        incident_id: { type: string, format: uuid }
+        server_id: { type: string, format: uuid }
+        server_name: { type: string }
+        service_id: { type: string, format: uuid }
+        service_name: { type: string }
+        rule_id: { type: string, format: uuid }
+        rule_name: { type: string }
+        title: { type: string }
+        severity: { $ref: "#/components/schemas/Severity" }
+        status: { type: string, enum: [open, resolved] }
+        started_at: { type: string, format: date-time }
+        resolved_at: { type: string, format: date-time }
+    ServiceStatusEventData:
+      type: object
+      description: service.status_changed (sem alvo nem mensagem de erro)
+      properties:
+        service_id: { type: string, format: uuid }
+        server_id: { type: string, format: uuid }
+        server_name: { type: string }
+        name: { type: string }
+        service_type: { type: string, enum: [http, tcp, systemd] }
+        previous_status: { type: string, enum: [unknown, up, down, degraded] }
+        status: { type: string, enum: [unknown, up, down, degraded] }
+        checked_at: { type: string, format: date-time }
+    ServerStatusEventData:
+      type: object
+      description: |
+        server.status_changed. Dois casos: mudança de conectividade (`connection_status` + `previous_connection_status`) ou do estado
+        administrativo (`status` + `previous_status`). `connection_status` e `status` sempre trazem o valor atual.
+      properties:
+        server_id: { type: string, format: uuid }
+        name: { type: string }
+        status: { type: string, enum: [active, maintenance, disabled] }
+        previous_status: { type: string }
+        connection_status: { type: string, enum: [online, offline, unknown] }
+        previous_connection_status: { type: string }
+        at: { type: string, format: date-time }
+    MetricsUpdatedEventData:
+      type: object
+      description: metrics.updated (efêmero; mínimo para atualizar cards)
+      properties:
+        server_id: { type: string, format: uuid }
+        collected_at: { type: string, format: date-time }
+        cpu_usage_percent: { type: number }
+        memory_used_percent: { type: number, nullable: true }
+    ResyncEventData:
+      type: object
+      description: O cliente deve recarregar o estado pela API REST e continuar ouvindo
+      properties:
+        reason: { type: string, enum: [gap, ahead, too_many, overflow, error] }
+    UserRole: { type: string, enum: [viewer, operator, admin], description: "viewer < operator < admin; cada operação documenta `x-required-role`" }
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string, format: email }
+        role: { $ref: "#/components/schemas/UserRole" }
+        is_active: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        last_login_at: { type: string, format: date-time, nullable: true }
+        password_changed_at: { type: string, format: date-time }
+    SessionInfo:
+      type: object
+      properties:
+        user: { $ref: "#/components/schemas/User" }
+        via: { type: string, enum: [session, api_key] }
+        csrf_token: { type: string, description: Enviar em X-CSRF-Token nas requisições que alteram estado }
+        expires_at: { type: string, format: date-time, description: Fim absoluto da sessão }
+        idle_expires_at: { type: string, format: date-time, description: Vence se não houver uso até este instante (renova a cada uso) }
+    AuditEntry:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        action: { type: string, example: user.update }
+        resource_type: { type: string }
+        resource_id: { type: string, nullable: true }
+        actor: { type: string, description: "E-mail do usuário, `api_key` ou `sistema`" }
+        actor_user_id: { type: string, format: uuid, nullable: true }
+        ip: { type: string, nullable: true }
+        metadata: { type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, details]
+          properties:
+            code: { type: string, example: VALIDATION_ERROR }
+            message: { type: string }
+            details:
+              type: array
+              items:
+                type: object
+                required: [message]
+                properties:
+                  field: { type: string }
+                  message: { type: string }

@@ -1,0 +1,38 @@
+# /etc/systemd/system/sentinela-agent.service
+# Instalação: veja deploy/install-agent.sh. O agente só faz requisições de SAÍDA e não executa comandos.
+[Unit]
+Description=Sentinela Agent (monitoramento)
+Documentation=https://github.com/seu-usuario/sentinela
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sentinela-agent
+Environment=SENTINELA_API_URL=https://sentinela.exemplo.com
+# O token fica em arquivo 0600 do root, lido via credencial do systemd (não aparece em `ps` nem em /proc/<pid>/environ).
+LoadCredential=agent-token:/etc/sentinela/agent-token
+Environment=SENTINELA_AGENT_TOKEN_FILE=%d/agent-token
+Restart=always
+RestartSec=5
+DynamicUser=yes
+# Endurecimento: o agente só lê /proc, /sys e statfs.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+MemoryMax=96M
+CPUQuota=20%
+
+[Install]
+WantedBy=multi-user.target

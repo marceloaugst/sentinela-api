@@ -1,0 +1,14 @@
+.env
+bin/
+*.out
+coverage.*
+.env.*
+!.env.example
+*.dump
+*.key
+*.pem
+*.crt
+*.tar.gz
+.idea/
+.vscode/
+.DS_Store

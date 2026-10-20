@@ -1,0 +1,76 @@
+# /etc/nginx/sites-available/sentinela  (troque sentinela.exemplo.com)
+# Pré-requisito: certificado emitido (sudo certbot --nginx -d sentinela.exemplo.com).
+# Limite de taxa por IP nas rotas sensíveis; o limite fino por usuário/IP está na própria API.
+limit_req_zone $binary_remote_addr zone=sentinela_login:10m rate=5r/s;
+limit_req_zone $binary_remote_addr zone=sentinela_api:10m   rate=30r/s;
+limit_conn_zone $binary_remote_addr zone=sentinela_conn:10m;
+
+server {
+    listen 80;
+    server_name sentinela.exemplo.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;             # nginx >= 1.25.1: use "listen 443 ssl;" + "http2 on;" (Ubuntu 24.04 traz 1.24)
+    server_name sentinela.exemplo.com;
+
+    ssl_certificate     /etc/letsencrypt/live/sentinela.exemplo.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/sentinela.exemplo.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    server_tokens off;
+    client_max_body_size 1m;                # a API também limita (1 MiB; 64 KiB para agentes)
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    # A API vê o host e o IP reais através destes cabeçalhos. Com TRUST_PROXY=true ela usa X-Real-IP,
+    # então NUNCA exponha a porta 8080 diretamente: só o Nginx deve alcançá-la (ela escuta em 127.0.0.1).
+    proxy_http_version 1.1;
+    proxy_set_header Host              $host;             # a verificação de Origin (CSRF) compara com este host
+    proxy_set_header X-Real-IP         $remote_addr;      # sobrescreve qualquer valor enviado pelo cliente
+    proxy_set_header X-Forwarded-For   $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Connection        "";
+
+    # --- stream de eventos (SSE): sem buffer e com leitura longa ---
+    location = /api/v1/events {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 1h;              # muito acima do heartbeat de 15 s
+        limit_conn sentinela_conn 20;
+    }
+
+    # --- login: limite estrito (cada tentativa custa CPU/memória por causa do Argon2id) ---
+    location = /api/v1/auth/login {
+        limit_req zone=sentinela_login burst=10 nodelay;
+        proxy_pass http://127.0.0.1:8080;
+    }
+
+    location /api/ {
+        limit_req zone=sentinela_api burst=100 nodelay;
+        proxy_pass http://127.0.0.1:8080;
+    }
+
+    # --- observabilidade: probes abertos; /metrics SÓ para a rede de monitoramento ---
+    location = /healthz { proxy_pass http://127.0.0.1:8080; access_log off; }
+    location = /readyz  { proxy_pass http://127.0.0.1:8080; access_log off; }
+    location = /metrics {
+        allow 127.0.0.1;
+        # allow 10.0.0.0/24;               # rede do Prometheus
+        deny all;
+        proxy_pass http://127.0.0.1:8080;  # e defina METRICS_TOKEN para exigir também o Bearer
+    }
+
+    # --- frontend (SPA) no MESMO domínio: cookie de sessão SameSite=Lax funciona sem CORS ---
+    location / {
+        root /var/www/sentinela;
+        try_files $uri /index.html;
+        add_header X-Content-Type-Options nosniff always;
+        add_header X-Frame-Options DENY always;
+        add_header Referrer-Policy no-referrer always;
+    }
+}
