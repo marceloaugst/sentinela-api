@@ -140,7 +140,7 @@ func TestRank(t *testing.T) {
 
 func TestChannelValidation(t *testing.T) {
 	ok := CreateInput{Name: "ops", BotToken: tok, ChatID: "-1001234567890"}
-	if p := ok.Validate(); len(p) != 0 || ok.MinSeverity != "critical" || ok.Type != "telegram" {
+	if p := ok.Validate(); len(p) != 0 || ok.MinSeverity != "info" || ok.Type != "telegram" {
 		t.Errorf("%v %+v", p, ok)
 	}
 	for name, in := range map[string]CreateInput{

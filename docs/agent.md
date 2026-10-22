@@ -41,7 +41,7 @@ Sem cadastro: a cada minuto o agente procura no próprio host ssh, systemd-journ
 O agente **não usa o socket do Docker** (dar acesso a ele equivale a root) e não executa comandos. Limite conhecido: um container de Redis/PostgreSQL **parado** não é visível sem o socket; aparece como `not_found`, e a dica já sugere o `docker run`. ### Ligação com os alertas
 Cada serviço descoberto que **já foi visto disponível** vira um serviço monitorado do tipo `discovered` (nome "SSH (automático)", etc.). Se depois ele ficar `stopped` ou `not_found`, o serviço passa a `down`, e a regra `service_down` abre alerta, incidente e notificação (Telegram etc.). Detalhes:
 - Quem **nunca existiu** no servidor (ex.: Redis não instalado) não gera alerta, só aparece como indisponível com o "o que fazer".
-- A migração `0010` cria a regra global **"Serviço indisponível"** (`service_down`, crítica, 120 s para disparar, 60 s para recuperar) se ainda não houver nenhuma regra `service_down`. Ajuste ou desative em `/alert-rules`.
+- A regra automática **"Serviço indisponível"** (`service_down`, P1, 120 s para disparar, 60 s para recuperar) faz parte do catálogo fixo (veja `docs/alertas-automaticos.md`) e não é editável.
 - Não há cadastro, edição nem exclusão de serviços pela API: a lista é sempre o que o agente encontra. Serviços cadastrados antes (`http`/`tcp`/`systemd`) foram arquivados pela migração `0011`.
 - O agente não verifica mais URLs `http` nem portas `tcp` a pedido da API; `GET /agent/config` só devolve parâmetros operacionais.
 - Servidor offline não gera alerta de serviço (só o de `server_offline`).

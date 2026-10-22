@@ -4,6 +4,7 @@ package alerts_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"sentinela/internal/alerts"
 	"sentinela/internal/audit"
 	"sentinela/internal/incidents"
+	"sentinela/internal/logstore"
 	"sentinela/internal/testutil"
 )
 
@@ -108,11 +110,13 @@ func (f *fx) rule(r alerts.Rule) string {
 	if r.Name == "" {
 		r.Name = "regra"
 	}
-	out, err := f.repo.CreateRule(ctx, actor, r)
-	if err != nil {
+	var id string
+	if err := f.pool.QueryRow(ctx, `INSERT INTO alert_rules (name, metric_name, operator, threshold, severity, priority, duration_seconds, recovery_seconds, server_id, is_enabled)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id::text`, r.Name, r.MetricName, r.Operator, r.Threshold, r.Severity,
+		max(r.Priority, 1), r.DurationSeconds, r.RecoverySeconds, r.ServerID, r.IsEnabled).Scan(&id); err != nil {
 		f.t.Fatal(err)
 	}
-	return out.ID
+	return id
 }
 
 func cpuRule(th float64, dur, rec int) alerts.Rule {
@@ -409,46 +413,81 @@ func TestOutOfScopeResolvesAlerts(t *testing.T) {
 	}
 }
 
-func TestDisablingAndDeletingRulesResolveTheirAlerts(t *testing.T) {
+// Regras fora do catálogo (cadastradas antes da automação) são arquivadas na sincronização e os
+// alertas delas são resolvidos pelo avaliador; o histórico fica.
+func TestSyncingCatalogArchivesLegacyRulesAndResolvesTheirAlerts(t *testing.T) {
 	f := newFx(t)
 	srv := f.server("web")
 	f.beat(srv, 99)
 	r1 := f.rule(cpuRule(90, 0, 0))
-	r2 := cpuRule(80, 0, 0)
-	r2.Name = "outra"
-	id2 := f.rule(r2)
 	f.tick()
-	if f.count(`SELECT count(*) FROM alerts WHERE status='firing'`) != 2 {
+	if f.count(`SELECT count(*) FROM alerts WHERE status='firing'`) != 1 {
 		t.Fatal("setup")
 	}
-	off := false
-	cur, _ := f.repo.GetRule(ctx, r1)
-	cur.IsEnabled = off
-	if _, err := f.repo.UpdateRule(ctx, actor, cur); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.repo.DeleteRule(ctx, actor, id2); err != nil {
+	if err := alerts.SyncCatalog(ctx, f.pool); err != nil {
 		t.Fatal(err)
 	}
 	f.advance(15 * time.Second)
+	f.beat(srv, 99) // o catálogo (CPU > 90 por 5 min) ainda não dispara
 	f.tick()
-	if f.str(`SELECT resolved_reason FROM alerts WHERE rule_id=$1`, r1) != "rule_disabled" || f.str(`SELECT resolved_reason FROM alerts WHERE rule_id=$1`, id2) != "rule_deleted" {
-		t.Errorf("motivos: %q", f.statuses())
+	if f.str(`SELECT resolved_reason FROM alerts WHERE rule_id=$1`, r1) != "rule_deleted" {
+		t.Errorf("motivo: %q", f.statuses())
 	}
-	if _, err := f.repo.GetRule(ctx, id2); err != alerts.ErrRuleNotFound {
-		t.Errorf("regra removida não deve ser visível: %v", err)
+	if _, err := f.repo.GetRule(ctx, r1); err != alerts.ErrRuleNotFound {
+		t.Errorf("regra arquivada não deve ser visível: %v", err)
 	}
-	if f.count(`SELECT count(*) FROM alerts`) != 2 {
+	if f.count(`SELECT count(*) FROM alerts WHERE rule_id=$1`, r1) != 1 {
 		t.Error("histórico de alertas deve ser preservado")
 	}
-	// regra reativada volta a alertar
-	cur.IsEnabled = true
-	f.repo.UpdateRule(ctx, actor, cur)
-	f.advance(15 * time.Second)
-	f.beat(srv, 99)
+}
+
+func TestCatalogDetectsSwapAndLoadPerCPU(t *testing.T) {
+	f := newFx(t)
+	f.pool.Exec(ctx, `DELETE FROM alert_rules`)
+	if err := alerts.SyncCatalog(ctx, f.pool); err != nil {
+		t.Fatal(err)
+	}
+	srv := f.server("web")
+	f.beat(srv, 10)
+	f.pool.Exec(ctx, `UPDATE server_metrics SET cpu_count=2, load_average_1m=6, swap_total_bytes=1000, swap_used_bytes=900 WHERE server_id=$1`, srv)
 	f.tick()
-	if f.count(`SELECT count(*) FROM alerts WHERE rule_id=$1 AND status='firing'`, r1) != 1 {
-		t.Errorf("regra reativada: %q", f.statuses())
+	f.advance(11 * time.Minute) // acima da duração de todas as regras
+	f.beat(srv, 10)
+	f.pool.Exec(ctx, `UPDATE server_metrics SET cpu_count=2, load_average_1m=6, swap_total_bytes=1000, swap_used_bytes=900 WHERE server_id=$1`, srv)
+	f.tick()
+	got := f.str(`SELECT string_agg(r.code || ':P' || i.priority, ',' ORDER BY r.code) FROM incidents i JOIN alert_rules r ON r.id=i.rule_id`)
+	if got != "load_high:P2,swap_high:P3" {
+		t.Errorf("incidentes: %q", got)
+	}
+	if f.str(`SELECT message FROM alerts a JOIN alert_rules r ON r.id=a.rule_id WHERE r.code='load_high'`) != "Load average de 3.00 por CPU (limite: > 2)" {
+		t.Error("mensagem de load")
+	}
+}
+
+func TestRecurrentIncidentIsFlagged(t *testing.T) {
+	f := newFx(t)
+	srv := f.server("web")
+	rule := cpuRule(90, 0, 0)
+	rule.Priority = alerts.P2
+	f.rule(rule)
+	for i := 0; i < 2; i++ {
+		f.beat(srv, 99)
+		f.tick() // abre
+		f.advance(15 * time.Second)
+		f.beat(srv, 10)
+		f.tick() // resolve
+		f.advance(15 * time.Second)
+	}
+	f.beat(srv, 99)
+	f.tick() // terceira vez: reincidente (2 resolvidos nas últimas 24 h)
+	if got := f.count(`SELECT recurrence_count FROM incidents WHERE status='open'`); got != 2 {
+		t.Errorf("recurrence_count = %d", got)
+	}
+	if f.count(`SELECT count(*) FROM incident_events e JOIN incidents i ON i.id=e.incident_id WHERE i.status='open' AND e.event_type='recurrent'`) != 1 {
+		t.Error("o incidente reincidente deve registrar o evento na linha do tempo")
+	}
+	if f.count(`SELECT priority FROM incidents WHERE status='open'`) != 2 {
+		t.Error("o incidente herda a prioridade da regra")
 	}
 }
 
@@ -691,5 +730,102 @@ func TestNewAlertReusesAnAlreadyOpenIncident(t *testing.T) {
 	// o índice único parcial impede um segundo incidente aberto idêntico mesmo por outro caminho
 	if _, err := f.pool.Exec(ctx, `INSERT INTO incidents (server_id, rule_id, title, severity) VALUES ($1,$2,'duplicado','critical')`, srv, ruleID); err == nil {
 		t.Error("o banco deveria recusar um segundo incidente aberto para a mesma falha")
+	}
+}
+
+type fakeSystem struct {
+	ready bool
+	err   error
+	vals  []logstore.SystemValue
+}
+
+func (s *fakeSystem) Ready() bool { return s.ready }
+func (s *fakeSystem) LatestSystem(context.Context, time.Duration) ([]logstore.SystemValue, error) {
+	return s.vals, s.err
+}
+
+func TestCatalogEvaluatesSystemMetricsFromClickHouse(t *testing.T) {
+	f := newFx(t)
+	f.pool.Exec(ctx, `DELETE FROM alert_rules`)
+	if err := alerts.SyncCatalog(ctx, f.pool); err != nil {
+		t.Fatal(err)
+	}
+	srv := f.server("web")
+	f.beat(srv, 10)
+	sys := &fakeSystem{ready: true, vals: []logstore.SystemValue{
+		{ServerID: srv, Metric: "oom_kills", Latest: 1, Sum: 3},
+		{ServerID: srv, Metric: "inode_used_percent", Subject: "/", Latest: 40},
+		{ServerID: srv, Metric: "inode_used_percent", Subject: "/data", Latest: 97},
+		{ServerID: srv, Metric: "cert_days_left", Subject: "a.exemplo.com", Latest: 30},
+		{ServerID: srv, Metric: "cert_days_left", Subject: "b.exemplo.com", Latest: 1.5},
+		{ServerID: srv, Metric: "ntp_unsynchronized", Latest: 0},
+	}}
+	f.ev.System = sys
+	f.tick()
+	f.advance(2*time.Hour + time.Minute) // acima de qualquer duração do catálogo
+	f.beat(srv, 10)
+	f.tick()
+	got := f.str(`SELECT string_agg(r.code || ':P' || i.priority, ',' ORDER BY r.code) FROM incidents i JOIN alert_rules r ON r.id=i.rule_id`)
+	if got != "cert_critical:P2,cert_expiring:P3,inodes_high:P2,oom_kill:P2" {
+		t.Errorf("incidentes: %q", got)
+	}
+	if m := f.str(`SELECT a.message FROM alerts a JOIN alert_rules r ON r.id=a.rule_id WHERE r.code='inodes_high'`); !strings.Contains(m, "/data") || !strings.Contains(m, "97.0%") {
+		t.Errorf("o pior volume deve aparecer: %q", m)
+	}
+	if m := f.str(`SELECT a.message FROM alerts a JOIN alert_rules r ON r.id=a.rule_id WHERE r.code='cert_critical'`); !strings.Contains(m, "b.exemplo.com") {
+		t.Errorf("o pior certificado deve aparecer: %q", m)
+	}
+
+	// ClickHouse fora do ar: nada abre nem resolve
+	sys.err = errors.New("clickhouse fora")
+	sys.vals = nil
+	f.advance(15 * time.Second)
+	f.beat(srv, 10)
+	f.tick()
+	if f.count(`SELECT count(*) FROM incidents WHERE status='open'`) != 4 {
+		t.Error("sem dados, os incidentes abertos devem permanecer")
+	}
+	// dados voltam normalizados: resolve
+	sys.err = nil
+	sys.vals = []logstore.SystemValue{{ServerID: srv, Metric: "oom_kills", Sum: 0}, {ServerID: srv, Metric: "inode_used_percent", Subject: "/", Latest: 10},
+		{ServerID: srv, Metric: "cert_days_left", Subject: "a.exemplo.com", Latest: 80}}
+	f.advance(5 * time.Hour) // acima da recuperação de 1 h dos certificados
+	f.beat(srv, 10)
+	f.tick()
+	f.advance(61 * time.Minute) // cumpre a recuperação de 1 h dos certificados
+	f.beat(srv, 10)
+	f.tick()
+	if n := f.count(`SELECT count(*) FROM incidents WHERE status='open'`); n != 0 {
+		t.Errorf("incidentes abertos após normalizar: %d", n)
+	}
+}
+
+// Toda notificação de alerta (qualquer prioridade, com ou sem canal externo) fica registrada no PostgreSQL.
+func TestEveryAlertIsRecordedAsNotification(t *testing.T) {
+	f := newFx(t)
+	srv := f.server("web")
+	f.beat(srv, 99)
+	crit := cpuRule(90, 0, 0)
+	crit.Priority = alerts.P1
+	f.rule(crit)
+	info := cpuRule(10, 0, 0)
+	info.Name, info.Severity, info.Priority = "CPU levemente usada", "info", alerts.P4
+	f.rule(info)
+	f.tick()
+	if n := f.count(`SELECT count(*) FROM notifications WHERE kind='alert_triggered'`); n != 2 {
+		t.Fatalf("2 alertas disparados deveriam virar 2 notificações, vieram %d", n)
+	}
+	f.tick() // condição persistente não repete
+	if f.count(`SELECT count(*) FROM notifications`) != 2 {
+		t.Error("a mesma condição não pode gerar notificações repetidas")
+	}
+	if f.count(`SELECT count(*) FROM notifications WHERE kind='alert_triggered' AND priority=1 AND severity='critical' AND server_id IS NOT NULL AND incident_id IS NOT NULL`) != 1 {
+		t.Error("prioridade/severidade/vínculos devem ser gravados")
+	}
+	f.advance(15 * time.Second)
+	f.beat(srv, 1)
+	f.tick() // recuperação
+	if n := f.count(`SELECT count(*) FROM notifications WHERE kind='alert_resolved' AND priority=4 AND severity='info' AND title LIKE 'Recuperado:%'`); n != 2 {
+		t.Errorf("recuperações registradas (P4): %d", n)
 	}
 }

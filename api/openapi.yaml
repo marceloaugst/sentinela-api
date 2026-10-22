@@ -997,7 +997,11 @@ paths:
   /api/v1/alert-rules:
     get:
       tags: [alerts]
-      summary: Lista regras de alerta
+      summary: Lista as regras automáticas de alerta (somente leitura)
+      description: |
+        As regras vêm de um catálogo fixo (CPU, RAM, swap, load, disco, servidor sem comunicação, serviço indisponível)
+        sincronizado com o PostgreSQL a cada inicialização da API. Não há cadastro, edição nem exclusão pela API.
+        Ordenadas por prioridade (P1 primeiro).
       operationId: listAlertRules
       x-required-role: viewer
       security: [{ sessionAuth: [] }, { adminKey: [] }]
@@ -1006,7 +1010,7 @@ paths:
         - { name: per_page, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
         - { name: metric_name, in: query, schema: { $ref: "#/components/schemas/MetricName" } }
         - { name: severity, in: query, schema: { $ref: "#/components/schemas/Severity" } }
-        - { name: server_id, in: query, schema: { type: string, format: uuid } }
+        - { name: priority, in: query, schema: { type: integer, enum: [1, 2, 3, 4] } }
         - { name: enabled, in: query, schema: { type: boolean } }
       responses:
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -1021,38 +1025,6 @@ paths:
                 properties:
                   data: { type: array, items: { $ref: "#/components/schemas/AlertRule" } }
                   meta: { $ref: "#/components/schemas/PageMeta" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "422": { $ref: "#/components/responses/Validation" }
-    post:
-      tags: [alerts]
-      summary: Cria uma regra de alerta
-      description: |
-        `duration_seconds`: tempo mínimo em que a condição deve persistir antes de abrir o alerta (0 = imediato).
-        `recovery_seconds`: tempo mínimo com a condição normalizada antes de resolver (0 = imediato).
-        `server_id` omitido = regra global (todos os servidores ativos).
-        Métricas: `cpu_usage_percent`, `memory_used_percent`, `disk_used_percent` (pior volume), `load_average_1m`,
-        `server_offline` (segundos sem comunicação; operador `>` ou `>=`) e `service_down` (operador `==`, limiar `1`).
-        Não há regras pré-criadas: os exemplos do projeto (CPU > 90%, RAM > 90%, disco > 85%...) precisam ser cadastrados.
-      operationId: createAlertRule
-      x-required-role: operator
-      security: [{ sessionAuth: [] }, { adminKey: [] }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/CreateAlertRule" }
-            example: { name: CPU alta, metric_name: cpu_usage_percent, operator: ">", threshold: 90, severity: critical, duration_seconds: 120, recovery_seconds: 60 }
-      responses:
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "429": { $ref: "#/components/responses/RateLimited" }
-        "201":
-          description: Criada
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  data: { $ref: "#/components/schemas/AlertRule" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "422": { $ref: "#/components/responses/Validation" }
   /api/v1/alert-rules/{id}:
@@ -1075,46 +1047,6 @@ paths:
                 type: object
                 properties:
                   data: { $ref: "#/components/schemas/AlertRule" }
-        "400": { $ref: "#/components/responses/InvalidId" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "404": { $ref: "#/components/responses/NotFound" }
-    patch:
-      tags: [alerts]
-      summary: Altera a regra (o conjunto resultante é revalidado)
-      description: Desativar a regra resolve seus alertas ativos (motivo `rule_disabled`) no próximo ciclo de avaliação.
-      operationId: updateAlertRule
-      x-required-role: operator
-      security: [{ sessionAuth: [] }, { adminKey: [] }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/UpdateAlertRule" }
-      responses:
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "429": { $ref: "#/components/responses/RateLimited" }
-        "200":
-          description: Regra atualizada
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  data: { $ref: "#/components/schemas/AlertRule" }
-        "400": { $ref: "#/components/responses/InvalidId" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "404": { $ref: "#/components/responses/NotFound" }
-        "422": { $ref: "#/components/responses/Validation" }
-    delete:
-      tags: [alerts]
-      summary: Remove a regra (exclusão lógica; o histórico de alertas permanece)
-      operationId: deleteAlertRule
-      x-required-role: operator
-      security: [{ sessionAuth: [] }, { adminKey: [] }]
-      responses:
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "429": { $ref: "#/components/responses/RateLimited" }
-        "204": { description: Removida }
         "400": { $ref: "#/components/responses/InvalidId" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1231,6 +1163,85 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { description: Alerta já resolvido (INVALID_STATE), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
 
+  /api/v1/notifications:
+    get:
+      tags: [notifications]
+      summary: Registro permanente de notificações (alertas disparados e recuperados, IPs banidos)
+      description: |
+        Toda notificação gerada fica gravada no PostgreSQL, com ou sem canal externo (Telegram) e independentemente da entrega.
+        Mais recentes primeiro. `meta.unread` traz o total de não lidas (todas, ignorando os filtros).
+      operationId: listNotifications
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: per_page, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: kind, in: query, schema: { type: string, enum: [alert_triggered, alert_resolved, ip_banned] } }
+        - { name: priority, in: query, schema: { $ref: "#/components/schemas/Priority" } }
+        - { name: server_id, in: query, schema: { type: string, format: uuid } }
+        - { name: unread, in: query, schema: { type: boolean } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Página de notificações
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Notification" } }
+                  meta:
+                    allOf:
+                      - $ref: "#/components/schemas/PageMeta"
+                      - { type: object, properties: { unread: { type: integer } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Validation" }
+  /api/v1/notifications/read-all:
+    post:
+      tags: [notifications]
+      summary: Marca todas as notificações como lidas
+      operationId: readAllNotifications
+      x-required-role: operator
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Quantas mudaram de estado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: object, properties: { marked: { type: integer } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/v1/notifications/{id}/read:
+    post:
+      tags: [notifications]
+      summary: Marca uma notificação como lida (idempotente)
+      operationId: readNotification
+      x-required-role: operator
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Notificação
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Notification" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
   /api/v1/incidents:
     get:
       tags: [incidents]
@@ -1243,6 +1254,7 @@ paths:
         - { name: per_page, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
         - { name: status, in: query, schema: { type: string, enum: [open, resolved] } }
         - { name: severity, in: query, schema: { $ref: "#/components/schemas/Severity" } }
+        - { name: priority, in: query, schema: { $ref: "#/components/schemas/Priority" } }
         - { name: server_id, in: query, schema: { type: string, format: uuid } }
         - { name: from, in: query, schema: { type: string, format: date-time } }
         - { name: to, in: query, schema: { type: string, format: date-time } }
@@ -1636,6 +1648,35 @@ paths:
         "422": { $ref: "#/components/responses/Validation" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "503": { $ref: "#/components/responses/LogsUnavailable" }
+  /api/v1/agent/system-metrics:
+    post:
+      tags: [agent]
+      summary: Lote de métricas de sistema (OOM Killer, inodes, latência de disco, NTP, atualizações, certificados)
+      description: |
+        Até 500 amostras e 256 KiB por lote, gravadas no ClickHouse. O servidor vem da credencial. `batch_id` torna o reenvio idempotente.
+        Alimentam as regras automáticas do catálogo. Responde **503 `LOGS_UNAVAILABLE`** sem ClickHouse (o agente descarta a amostra).
+      operationId: agentSystemMetrics
+      security: [{ agentToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SystemMetricBatch" }
+      responses:
+        "200":
+          description: Gravado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: object, properties: { stored: { type: integer } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ServerDisabled" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "422": { $ref: "#/components/responses/Validation" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/LogsUnavailable" }
   /api/v1/agent/config:
     get:
       tags: [agent]
@@ -2005,7 +2046,7 @@ components:
         resolved_at: { type: string, format: date-time, nullable: true }
         duration_seconds: { type: integer, format: int64 }
     Severity: { type: string, enum: [info, warning, critical] }
-    MetricName: { type: string, enum: [cpu_usage_percent, memory_used_percent, disk_used_percent, load_average_1m, server_offline, service_down] }
+    MetricName: { type: string, enum: [cpu_usage_percent, memory_used_percent, disk_used_percent, load_average_1m, server_offline, service_down, swap_used_percent, load_per_cpu, oom_kills_10m, inode_used_percent, disk_latency_ms, ntp_unsynchronized, security_updates, cert_days_left] }
     ServiceConfig:
       type: object
       description: Mantido por compatibilidade; sem efeito (os serviços são descobertos automaticamente)
@@ -2080,40 +2121,61 @@ components:
             unavailable: { type: integer }
         services: { type: array, items: { $ref: "#/components/schemas/DiscoveryItem" } }
         checked_at: { type: string, format: date-time, nullable: true }
-    CreateAlertRule:
+    SystemMetricBatch:
       type: object
-      required: [name, metric_name, operator, threshold, severity]
+      required: [batch_id, samples]
       properties:
-        name: { type: string, minLength: 1, maxLength: 120 }
-        metric_name: { $ref: "#/components/schemas/MetricName" }
-        operator: { type: string, enum: [">", ">=", "<", "<=", "=="] }
-        threshold: { type: number }
-        severity: { $ref: "#/components/schemas/Severity" }
-        duration_seconds: { type: integer, minimum: 0, maximum: 86400, default: 0 }
-        recovery_seconds: { type: integer, minimum: 0, maximum: 86400, default: 0 }
-        server_id: { type: string, format: uuid, nullable: true, description: Omitido = global }
-        is_enabled: { type: boolean, default: true }
-    UpdateAlertRule:
+        batch_id: { type: string, pattern: "^[A-Za-z0-9-]{8,64}$" }
+        samples:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items:
+            type: object
+            required: [time, metric, value]
+            properties:
+              time: { type: string, format: date-time }
+              metric: { type: string, enum: [oom_kills, inode_used_percent, disk_latency_ms, ntp_unsynchronized, security_updates, cert_days_left] }
+              subject: { type: string, maxLength: 128, description: "Ponto de montagem, dispositivo ou domínio do certificado" }
+              value: { type: number }
+    Notification:
       type: object
-      minProperties: 1
       properties:
-        name: { type: string }
-        metric_name: { $ref: "#/components/schemas/MetricName" }
-        operator: { type: string, enum: [">", ">=", "<", "<=", "=="] }
-        threshold: { type: number }
+        id: { type: integer, format: int64 }
+        kind: { type: string, enum: [alert_triggered, alert_resolved, ip_banned] }
+        priority: { $ref: "#/components/schemas/Priority" }
         severity: { $ref: "#/components/schemas/Severity" }
-        duration_seconds: { type: integer }
-        recovery_seconds: { type: integer }
-        server_id: { type: string, format: uuid, description: "Não é possível voltar a global por PATCH; recrie a regra" }
-        is_enabled: { type: boolean }
+        server_id: { type: string, format: uuid, nullable: true }
+        server_name: { type: string, nullable: true }
+        alert_id: { type: string, format: uuid, nullable: true }
+        incident_id: { type: string, format: uuid, nullable: true }
+        title: { type: string }
+        message: { type: string }
+        data: { type: object, description: Cópia do conteúdo enviado (nomes, horário) }
+        created_at: { type: string, format: date-time }
+        read_at: { type: string, format: date-time, nullable: true }
     AlertRule:
-      allOf:
-        - $ref: "#/components/schemas/CreateAlertRule"
-        - type: object
-          properties:
-            id: { type: string, format: uuid }
-            created_at: { type: string, format: date-time }
-            updated_at: { type: string, format: date-time }
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string, nullable: true, description: Identificador estável da regra do catálogo }
+        name: { type: string }
+        description: { type: string }
+        metric_name: { $ref: "#/components/schemas/MetricName" }
+        operator: { type: string, enum: [">", ">=", "<", "<=", "=="] }
+        threshold: { type: number }
+        priority: { $ref: "#/components/schemas/Priority" }
+        severity: { $ref: "#/components/schemas/Severity" }
+        duration_seconds: { type: integer, description: Tempo com a condição verdadeira antes de alertar }
+        recovery_seconds: { type: integer, description: Tempo com a condição normalizada antes de resolver }
+        server_id: { type: string, format: uuid, nullable: true, description: Sempre nulo; as regras valem para todos os servidores }
+        is_enabled: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    Priority:
+      type: integer
+      enum: [1, 2, 3, 4]
+      description: P1 crítico (notificação imediata), P2 alto, P3 atenção (aparece no painel), P4 informativo (histórico). P1 e P2 têm severidade critical, P3 warning e P4 info.
     Alert:
       type: object
       properties:
@@ -2126,6 +2188,7 @@ components:
         service_name: { type: string, nullable: true }
         incident_id: { type: string, format: uuid, nullable: true }
         status: { type: string, enum: [firing, acknowledged, resolved] }
+        priority: { $ref: "#/components/schemas/Priority" }
         severity: { $ref: "#/components/schemas/Severity" }
         message: { type: string }
         value: { type: number, nullable: true }
@@ -2147,6 +2210,8 @@ components:
         service_name: { type: string, nullable: true }
         title: { type: string }
         severity: { $ref: "#/components/schemas/Severity" }
+        priority: { $ref: "#/components/schemas/Priority" }
+        recurrence_count: { type: integer, description: Incidentes iguais (mesmo servidor, regra e serviço) resolvidos nas 24 h anteriores; maior que 0 = reincidente }
         status: { type: string, enum: [open, resolved] }
         started_at: { type: string, format: date-time }
         resolved_at: { type: string, format: date-time, nullable: true }

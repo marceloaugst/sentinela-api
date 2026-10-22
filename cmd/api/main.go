@@ -131,10 +131,6 @@ func run(args []string) error {
 			Batch: 10000, Log: log, Metrics: metrics, EventsRetention: cfg.EventsRetention,
 		}).Run(jobCtx)
 	})
-	evaluator := &alerts.Evaluator{Pool: pool, Log: log, HeartbeatTimeout: cfg.AgentHeartbeatTimeout, Metrics: metrics}
-	spawn(func() {
-		scheduler.Loop(jobCtx, "alert_evaluation", cfg.AlertEvaluationInterval, metrics, log, evaluator.Tick)
-	})
 	worker := &notifications.Worker{
 		Pool: pool, Box: box, Channels: channels, Sender: notifications.NewTelegram(cfg.TelegramAPIBase),
 		Log: log, Metrics: metrics, MaxAttempts: cfg.NotificationMaxAttempts,
@@ -187,6 +183,17 @@ func run(args []string) error {
 		log.Info("logs desativados (CLICKHOUSE_URL vazia)")
 	}
 
+	// Regras automáticas: grava o catálogo no PostgreSQL e arquiva qualquer regra fora dele.
+	if err := alerts.SyncCatalog(ctx, pool); err != nil {
+		return fmt.Errorf("sincronizar regras de alerta: %w", err)
+	}
+	evaluator := &alerts.Evaluator{Pool: pool, Log: log, HeartbeatTimeout: cfg.AgentHeartbeatTimeout, Metrics: metrics}
+	if logStore != nil { // métricas de sistema (OOM, inodes, NTP, certificados...) vivem no ClickHouse
+		evaluator.System = logStore
+	}
+	spawn(func() {
+		scheduler.Loop(jobCtx, "alert_evaluation", cfg.AlertEvaluationInterval, metrics, log, evaluator.Tick)
+	})
 	srv := &nethttp.Server{
 		Addr: cfg.HTTPAddr,
 		Handler: apphttp.NewRouter(apphttp.Deps{

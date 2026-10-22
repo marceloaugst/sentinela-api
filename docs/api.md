@@ -39,10 +39,11 @@ Papéis `viewer < operator < admin`; cada operação do OpenAPI declara `x-requi
 | GET | /api/v1/servers/{id}/services | Serviços do servidor |
 | GET | /api/v1/servers/{id}/discovery | Serviços do sistema descobertos automaticamente (disponibilidade + o que fazer) |
 | GET | /api/v1/servers/{id}/incidents | Incidentes do servidor |
-| GET/POST | /api/v1/alert-rules | Listar / criar regras de alerta |
-| GET/PATCH/DELETE | /api/v1/alert-rules/{id} | Detalhe / alterar / exclusão lógica |
+| GET | /api/v1/alert-rules, /api/v1/alert-rules/{id} | Regras automáticas (catálogo fixo, somente leitura; filtro `priority`) |
 | GET | /api/v1/alerts, /api/v1/alerts/{id} | Listar (filtros) / detalhe |
 | POST | /api/v1/alerts/{id}/acknowledge, /resolve | Reconhecer (idempotente) / resolver manualmente |
+| GET | /api/v1/notifications | Registro permanente de notificações (alertas, recuperações, IPs banidos) |
+| POST | /api/v1/notifications/{id}/read, /notifications/read-all | Marcar como lida(s) |
 | GET | /api/v1/incidents, /incidents/{id}, /incidents/{id}/events | Incidentes, detalhe com alertas e linha do tempo |
 | GET/POST | /api/v1/notification-channels | Listar / cadastrar canal Telegram |
 | GET/PATCH/DELETE | /api/v1/notification-channels/{id} | Detalhe / alterar / remover |

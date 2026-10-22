@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"sentinela/internal/logs"
+	"sentinela/internal/sysmetrics"
 )
 
 func testStore(t *testing.T) *Store {
@@ -150,5 +151,48 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		if _, err := New(c); err == nil {
 			t.Errorf("deveria rejeitar %+v", c)
 		}
+	}
+}
+
+func TestSystemMetricsInsertAndLatest(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	if err := s.exec(ctx, "TRUNCATE TABLE "+s.systemTable(), nil); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	batch := []sysmetrics.Sample{
+		{Time: now.Add(-3 * time.Minute), Metric: sysmetrics.OOMKills, Value: 1},
+		{Time: now.Add(-2 * time.Minute), Metric: sysmetrics.OOMKills, Value: 2},
+		{Time: now.Add(-2 * time.Minute), Metric: sysmetrics.InodeUsed, Subject: "/", Value: 50},
+		{Time: now.Add(-time.Minute), Metric: sysmetrics.InodeUsed, Subject: "/", Value: 95},
+		{Time: now.Add(-time.Minute), Metric: sysmetrics.InodeUsed, Subject: "/data", Value: 10},
+	}
+	if err := s.InsertSystem(ctx, srvA, "lote-0001", batch); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertSystem(ctx, srvA, "lote-0001", batch); err != nil { // reenvio não duplica
+		t.Fatal(err)
+	}
+	old := []sysmetrics.Sample{{Time: now.Add(-time.Hour), Metric: sysmetrics.NTPUnsynced, Value: 1}}
+	if err := s.InsertSystem(ctx, srvB, "lote-0002", old); err != nil {
+		t.Fatal(err)
+	}
+	vals, err := s.LatestSystem(ctx, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]SystemValue{}
+	for _, v := range vals {
+		got[v.ServerID+"|"+v.Metric+"|"+v.Subject] = v
+	}
+	if len(got) != 3 {
+		t.Fatalf("esperava 3 séries (dado fora da janela não conta): %+v", vals)
+	}
+	if o := got[srvA+"|oom_kills|"]; o.Sum != 3 || o.Latest != 2 {
+		t.Errorf("oom: %+v", o)
+	}
+	if i := got[srvA+"|inode_used_percent|/"]; i.Latest != 95 {
+		t.Errorf("inodes: %+v", i)
 	}
 }

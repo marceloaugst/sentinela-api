@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -21,6 +23,7 @@ import (
 	"sentinela/internal/discovery"
 	"sentinela/internal/logtail"
 	"sentinela/internal/metrics"
+	"sentinela/internal/sysmetrics"
 )
 
 var version = "dev"
@@ -127,6 +130,7 @@ func run(log *slog.Logger) error {
 		log.Warn("heartbeat inicial falhou; seguindo", "err", err)
 	}
 	disc := newDiscoveryRunner(log, client)
+	sys := newSystemRunner(log, client)
 	logsDone := startLogShipper(ctx, log, cfg)
 	defer func() { stop(); <-logsDone }() // garante que a posição dos logs foi gravada antes de sair
 	if remote := fetchCollectInterval(ctx, log, client); cfg.interval == 0 && remote > 0 {
@@ -145,6 +149,7 @@ func run(log *slog.Logger) error {
 	for {
 		collectAndSend(ctx, log, col, client, interval)
 		disc.runDue(ctx)
+		sys.runDue(ctx)
 		select {
 		case <-ctx.Done():
 			log.Info("agente encerrando")
@@ -272,4 +277,45 @@ func (r *discoveryRunner) runDue(ctx context.Context) {
 		return
 	}
 	r.lastKey, r.lastSent = key, now
+}
+
+// systemRunner coleta a cada minuto as métricas de sistema (OOM Killer, inodes, latência de disco, NTP,
+// atualizações de segurança, certificados) e as envia a /agent/system-metrics, que as grava no ClickHouse.
+// Sem ClickHouse (503) ou com falha de rede, a amostra é descartada: a próxima rodada traz dados novos.
+type systemRunner struct {
+	log       *slog.Logger
+	client    *agentclient.Client
+	collector *collector.SystemCollector
+	lastRun   time.Time
+}
+
+const systemEvery = time.Minute
+
+func newSystemRunner(log *slog.Logger, c *agentclient.Client) *systemRunner {
+	return &systemRunner{log: log, client: c, collector: collector.NewSystemCollector()}
+}
+
+func (r *systemRunner) runDue(ctx context.Context) {
+	now := time.Now()
+	if now.Sub(r.lastRun) < systemEvery {
+		return
+	}
+	r.lastRun = now
+	samples := r.collector.Collect(now)
+	if len(samples) == 0 {
+		return
+	}
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return
+	}
+	body := sysmetrics.Batch{BatchID: hex.EncodeToString(id[:]), Samples: samples}
+	sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	if err := r.client.Do(sctx, "POST", "/api/v1/agent/system-metrics", body, nil); err != nil {
+		logRejection(r.log, err)
+		r.log.Warn("envio de métricas de sistema falhou; amostra descartada", "err", err)
+		return
+	}
+	r.log.Debug("métricas de sistema enviadas", "samples", len(samples))
 }

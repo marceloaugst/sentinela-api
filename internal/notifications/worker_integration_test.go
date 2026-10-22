@@ -304,7 +304,6 @@ func TestEndToEndNoRepeatedNotificationsWhileConditionPersists(t *testing.T) {
 	e.channel("critical")
 	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 	ev := &alerts.Evaluator{Pool: e.pool, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), HeartbeatTimeout: time.Minute, Now: func() time.Time { return now }}
-	arepo := alerts.NewRepository(e.pool)
 
 	var srv string
 	e.pool.QueryRow(ctx, `INSERT INTO servers (name, hostname) VALUES ('web-1','h') RETURNING id`).Scan(&srv)
@@ -312,9 +311,7 @@ func TestEndToEndNoRepeatedNotificationsWhileConditionPersists(t *testing.T) {
 		e.pool.Exec(ctx, `INSERT INTO server_metrics (server_id, collected_at, cpu_usage_percent, memory_total_bytes, memory_used_bytes, memory_available_bytes) VALUES ($1,$2,$3,10,5,5)`, srv, now, cpu)
 		e.pool.Exec(ctx, `UPDATE servers SET last_seen_at=$2 WHERE id=$1`, srv, now)
 	}
-	arepo.CreateRule(ctx, actor, alerts.Rule{Name: "CPU alta", MetricName: alerts.MetricCPU, Operator: ">", Threshold: 90, Severity: "critical", IsEnabled: true})
-	warnRule := alerts.Rule{Name: "CPU média", MetricName: alerts.MetricCPU, Operator: ">", Threshold: 50, Severity: "warning", IsEnabled: true}
-	arepo.CreateRule(ctx, actor, warnRule)
+	e.pool.Exec(ctx, `INSERT INTO alert_rules (name, metric_name, operator, threshold, severity) VALUES ('CPU alta','cpu_usage_percent','>',90,'critical'), ('CPU média','cpu_usage_percent','>',50,'warning')`)
 
 	// 20 coletas consecutivas com a condição ativa
 	for i := 0; i < 20; i++ {
@@ -546,5 +543,32 @@ func TestTestMessageIsDelivered(t *testing.T) {
 	}
 	if err := e.chans.EnqueueTest(ctx, "00000000-0000-0000-0000-000000000000"); err != notifications.ErrChannelNotFound {
 		t.Errorf("canal inexistente: %v", err)
+	}
+}
+
+// IP banido vira registro permanente e mensagem para todos os canais (nada fica de fora por severidade).
+func TestIPBanIsRecordedAndSentToEveryChannel(t *testing.T) {
+	e := newEnv(t)
+	e.channel("info")
+	var srv string
+	e.pool.QueryRow(ctx, `INSERT INTO servers (name, hostname) VALUES ('web-1','h') RETURNING id`).Scan(&srv)
+	tx, _ := e.pool.Begin(ctx)
+	p := notifications.Payload{Kind: notifications.KindIPBanned, ServerID: srv, ServerName: "web-1", RuleName: "203.0.113.9",
+		Severity: "warning", Priority: 3, Message: "IP 203.0.113.9 banido na jail sshd", At: time.Now()}
+	if err := notifications.EnqueueEvent(ctx, tx, p, "ban:x:203.0.113.9:1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := notifications.EnqueueEvent(ctx, tx, p, "ban:x:203.0.113.9:1"); err != nil { // mesma chave: a fila não repete
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	e.tick()
+	if e.tg.count() != 1 || !strings.Contains(e.tg.texts()[0], "IP banido") || !strings.Contains(e.tg.texts()[0], "203.0.113.9") {
+		t.Errorf("mensagem: %v", e.tg.texts())
+	}
+	if e.count(`SELECT count(*) FROM notifications WHERE kind='ip_banned'`) == 0 {
+		t.Error("o ban deve ficar registrado")
 	}
 }

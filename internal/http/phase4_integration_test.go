@@ -36,8 +36,7 @@ func TestPhase4EndpointsRequireAdminKey(t *testing.T) {
 	zero := "00000000-0000-0000-0000-000000000000"
 	reqs := [][2]string{
 		{"GET", "/services"}, {"GET", "/services/" + zero}, {"GET", "/servers/" + id + "/services"},
-		{"GET", "/servers/" + id + "/incidents"}, {"GET", "/alert-rules"}, {"POST", "/alert-rules"},
-		{"GET", "/alert-rules/" + zero}, {"PATCH", "/alert-rules/" + zero}, {"DELETE", "/alert-rules/" + zero},
+		{"GET", "/servers/" + id + "/incidents"}, {"GET", "/alert-rules"}, {"GET", "/alert-rules/" + zero},
 		{"GET", "/alerts"}, {"GET", "/alerts/" + zero}, {"POST", "/alerts/" + zero + "/acknowledge"},
 		{"POST", "/alerts/" + zero + "/resolve"}, {"GET", "/incidents"}, {"GET", "/incidents/" + zero},
 		{"GET", "/incidents/" + zero + "/events"}, {"GET", "/notification-channels"}, {"POST", "/notification-channels"},
@@ -53,85 +52,68 @@ func TestPhase4EndpointsRequireAdminKey(t *testing.T) {
 	}
 }
 
-func TestAlertRulesAPI(t *testing.T) {
+// rule insere direto no banco uma regra de teste (a API não cadastra regras) e devolve o id.
+func (e *env) rule(name, metric, op string, threshold float64, severity string, duration int, serverID string) string {
+	e.t.Helper()
+	var sid any
+	if serverID != "" {
+		sid = serverID
+	}
+	return e.queryID(`INSERT INTO alert_rules (name, metric_name, operator, threshold, severity, duration_seconds, server_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id::text`, name, metric, op, threshold, severity, duration, sid)
+}
+
+func TestAlertRulesAreAutomaticAndReadOnly(t *testing.T) {
 	e := newEnv(t, adminKey)
-	e.exec(`DELETE FROM alert_rules`) // a migração cria uma regra service_down padrão
-	srv := e.createServer("web-1")
-
-	body := map[string]any{"name": "CPU alta", "metric_name": "cpu_usage_percent", "operator": ">", "threshold": 90, "severity": "critical", "duration_seconds": 120, "recovery_seconds": 60}
-	r := e.post("/api/v1/alert-rules", body)
-	if r.Status != 201 || r.data()["is_enabled"] != true || r.data()["server_id"] != nil || !strings.HasPrefix(r.Header.Get("Location"), "/api/v1/alert-rules/") {
-		t.Fatalf("criar: %d %s", r.Status, r.Raw)
+	ctx := context.Background()
+	legacy := e.rule("Regra antiga", "cpu_usage_percent", ">", 50, "info", 0, "")
+	if err := alerts.SyncCatalog(ctx, e.pool); err != nil {
+		t.Fatal(err)
 	}
-	id := r.data()["id"].(string)
-	scoped := map[string]any{"name": "Disco /data", "metric_name": "disk_used_percent", "operator": ">", "threshold": 85, "severity": "warning", "server_id": srv}
-	if r := e.post("/api/v1/alert-rules", scoped); r.Status != 201 || r.data()["server_id"] != srv {
-		t.Fatalf("regra por servidor: %d %s", r.Status, r.Raw)
+	if err := alerts.SyncCatalog(ctx, e.pool); err != nil { // idempotente
+		t.Fatal(err)
 	}
-	e.post("/api/v1/alert-rules", map[string]any{"name": "Sem comunicação", "metric_name": "server_offline", "operator": ">", "threshold": 120, "severity": "critical", "is_enabled": false})
-	e.post("/api/v1/alert-rules", map[string]any{"name": "Serviço fora", "metric_name": "service_down", "operator": "==", "threshold": 1, "severity": "critical"})
-
-	bad := map[string]map[string]any{
-		"threshold ausente":  {"name": "x", "metric_name": "cpu_usage_percent", "operator": ">", "severity": "info"},
-		"cpu > 100":          {"name": "x", "metric_name": "cpu_usage_percent", "operator": ">", "threshold": 150, "severity": "info"},
-		"métrica":            {"name": "x", "metric_name": "uptime", "operator": ">", "threshold": 1, "severity": "info"},
-		"operador":           {"name": "x", "metric_name": "cpu_usage_percent", "operator": "!=", "threshold": 1, "severity": "info"},
-		"severidade":         {"name": "x", "metric_name": "cpu_usage_percent", "operator": ">", "threshold": 1, "severity": "grave"},
-		"duração":            {"name": "x", "metric_name": "cpu_usage_percent", "operator": ">", "threshold": 1, "severity": "info", "duration_seconds": -5},
-		"servidor inexist.":  {"name": "x", "metric_name": "cpu_usage_percent", "operator": ">", "threshold": 1, "severity": "info", "server_id": "00000000-0000-0000-0000-000000000000"},
-		"service_down com >": {"name": "x", "metric_name": "service_down", "operator": ">", "threshold": 1, "severity": "info"},
+	if n := e.count(`SELECT count(*) FROM alert_rules WHERE deleted_at IS NULL`); n != len(alerts.Catalog) {
+		t.Fatalf("regras ativas = %d, esperado %d (o catálogo)", n, len(alerts.Catalog))
 	}
-	for name, b := range bad {
-		if r := e.post("/api/v1/alert-rules", b); r.Status != 422 {
-			t.Errorf("%s: %d %s", name, r.Status, r.Raw)
-		}
-	}
-	if r := e.post("/api/v1/alert-rules", `{"name":"x","metric_name":"cpu_usage_percent","operator":">","threshold":1,"severity":"info","query":"drop table"}`); r.Status != 400 {
-		t.Errorf("campo desconhecido: %d", r.Status)
+	if e.count(`SELECT count(*) FROM alert_rules WHERE id=$1 AND deleted_at IS NOT NULL AND NOT is_enabled`, legacy) != 1 {
+		t.Error("a regra cadastrada à mão deve ser arquivada")
 	}
 
-	for q, want := range map[string]int{"": 4, "metric_name=cpu_usage_percent": 1, "severity=critical": 3, "enabled=false": 1, "enabled=true": 3, "server_id=" + srv: 1, "per_page=2&page=2": 2} {
+	r := e.admin("GET", "/api/v1/alert-rules", nil)
+	if r.Status != 200 || len(r.list()) != len(alerts.Catalog) {
+		t.Fatalf("lista: %d %s", r.Status, r.Raw)
+	}
+	first := r.list()[0].(map[string]any)
+	if first["priority"] != float64(1) || first["code"] == nil || first["server_id"] != nil {
+		t.Errorf("a lista deve vir por prioridade, com código e sem escopo por servidor: %v", first)
+	}
+	for q, want := range map[string]int{"priority=1": 3, "priority=2": 6, "priority=3": 6, "priority=4": 0, "metric_name=disk_used_percent": 2, "severity=warning": 6} {
 		if r := e.admin("GET", "/api/v1/alert-rules?"+q, nil); r.Status != 200 || len(r.list()) != want {
 			t.Errorf("%q: %d (esperado %d) %s", q, len(r.list()), want, r.Raw)
 		}
 	}
-	if r := e.admin("GET", "/api/v1/alert-rules?enabled=talvez", nil); r.Status != 422 {
-		t.Errorf("enabled inválido: %d", r.Status)
+	if r := e.admin("GET", "/api/v1/alert-rules?priority=9", nil); r.Status != 422 {
+		t.Errorf("priority inválida: %d", r.Status)
+	}
+	id := first["id"].(string)
+	if r := e.admin("GET", "/api/v1/alert-rules/"+id, nil); r.Status != 200 {
+		t.Errorf("get: %d", r.Status)
+	}
+	// não há cadastro, edição nem exclusão
+	for _, rq := range [][2]string{{"POST", "/api/v1/alert-rules"}, {"PATCH", "/api/v1/alert-rules/" + id}, {"DELETE", "/api/v1/alert-rules/" + id}} {
+		if r := e.admin(rq[0], rq[1], map[string]any{"threshold": 1}); r.Status != 404 && r.Status != 405 {
+			t.Errorf("%s %s deveria não existir: %d", rq[0], rq[1], r.Status)
+		}
 	}
 
-	// atualização
-	r = e.admin("PATCH", "/api/v1/alert-rules/"+id, map[string]any{"threshold": 80, "severity": "warning", "is_enabled": false})
-	if r.Status != 200 || r.data()["threshold"] != float64(80) || r.data()["severity"] != "warning" || r.data()["is_enabled"] != false || r.data()["duration_seconds"] != float64(120) {
-		t.Errorf("patch: %d %s", r.Status, r.Raw)
+	// um ajuste no banco é desfeito na próxima sincronização (o código é a fonte da verdade)
+	e.exec(`UPDATE alert_rules SET threshold = 1, is_enabled = false WHERE id=$1`, id)
+	if err := alerts.SyncCatalog(ctx, e.pool); err != nil {
+		t.Fatal(err)
 	}
-	if r := e.admin("PATCH", "/api/v1/alert-rules/"+id, map[string]any{"metric_name": "service_down"}); r.Status != 422 {
-		t.Errorf("trocar a métrica invalida o conjunto: %d", r.Status)
-	}
-	if r := e.admin("PATCH", "/api/v1/alert-rules/"+id, `{}`); r.Status != 422 {
-		t.Errorf("patch vazio: %d", r.Status)
-	}
-	if r := e.admin("PATCH", "/api/v1/alert-rules/00000000-0000-0000-0000-000000000000", map[string]any{"threshold": 1}); r.Status != 404 {
-		t.Errorf("inexistente: %d", r.Status)
-	}
-	if r := e.admin("GET", "/api/v1/alert-rules/"+id, nil); r.Status != 200 || r.data()["threshold"] != float64(80) {
-		t.Errorf("get: %s", r.Raw)
-	}
-	if r := e.admin("DELETE", "/api/v1/alert-rules/"+id, nil); r.Status != 204 {
-		t.Errorf("delete: %d", r.Status)
-	}
-	if r := e.admin("GET", "/api/v1/alert-rules/"+id, nil); r.Status != 404 {
-		t.Errorf("após delete: %d", r.Status)
-	}
-	if r := e.admin("DELETE", "/api/v1/alert-rules/"+id, nil); r.Status != 404 {
-		t.Errorf("delete repetido: %d", r.Status)
-	}
-	if e.count(`SELECT count(*) FROM alert_rules WHERE id=$1 AND deleted_at IS NOT NULL`, id) != 1 {
-		t.Error("exclusão deve ser lógica")
-	}
-	for _, a := range []string{"alert_rule.create", "alert_rule.update", "alert_rule.delete"} {
-		if e.count(`SELECT count(*) FROM audit_logs WHERE action=$1`, a) == 0 {
-			t.Errorf("auditoria %s ausente", a)
-		}
+	if r := e.admin("GET", "/api/v1/alert-rules/"+id, nil); r.data()["is_enabled"] != true || r.data()["threshold"] == float64(1) {
+		t.Errorf("a sincronização deve restaurar a regra: %s", r.Raw)
 	}
 }
 
@@ -142,10 +124,9 @@ func TestAlertsAndIncidentsAPIEndToEnd(t *testing.T) {
 	e.sample(srv, now, 97, 4, 500, 1000, nil, nil)
 	e.exec(`UPDATE servers SET last_seen_at = now() WHERE id=$1`, srv)
 
-	r := e.post("/api/v1/alert-rules", map[string]any{"name": "CPU alta", "metric_name": "cpu_usage_percent", "operator": ">", "threshold": 90, "severity": "critical", "duration_seconds": 0})
-	ruleID := r.data()["id"].(string)
+	ruleID := e.rule("CPU alta", "cpu_usage_percent", ">", 90, "critical", 0, "")
 	// com duração, a regra cria apenas "pending": invisível na API e fora dos agregados do dashboard
-	e.post("/api/v1/alert-rules", map[string]any{"name": "Mem lenta", "metric_name": "memory_used_percent", "operator": ">=", "threshold": 10, "severity": "warning", "duration_seconds": 600})
+	e.rule("Mem lenta", "memory_used_percent", ">=", 10, "warning", 600, "")
 
 	if err := e.evaluator().Tick(context.Background()); err != nil {
 		t.Fatal(err)
@@ -194,7 +175,7 @@ func TestAlertsAndIncidentsAPIEndToEnd(t *testing.T) {
 	}
 
 	// reconhecimento
-	r = e.post("/api/v1/alerts/"+id+"/acknowledge", map[string]any{"note": "olhando agora"})
+	r := e.post("/api/v1/alerts/"+id+"/acknowledge", map[string]any{"note": "olhando agora"})
 	if r.Status != 200 || r.data()["status"] != "acknowledged" || r.data()["acknowledged_at"] == nil {
 		t.Fatalf("ack: %d %s", r.Status, r.Raw)
 	}

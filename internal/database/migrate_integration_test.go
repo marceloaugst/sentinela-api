@@ -47,20 +47,20 @@ func TestMigrationsUpIdempotentDown(t *testing.T) {
 	ctx := context.Background()
 
 	n, err := m.Up(ctx)
-	if err != nil || n != 11 {
+	if err != nil || n != 13 {
 		t.Fatalf("up: n=%d err=%v", n, err)
 	}
-	if got := count(tablesQ); got != 18 {
+	if got := count(tablesQ); got != 19 {
 		t.Errorf("tabelas após up: %d", got)
 	}
 	n, err = m.Up(ctx)
 	if err != nil || n != 0 {
 		t.Errorf("segundo up deveria ser no-op: n=%d err=%v", n, err)
 	}
-	if v, _ := m.Version(ctx); v != 11 {
+	if v, _ := m.Version(ctx); v != 13 {
 		t.Errorf("versão %d", v)
 	}
-	if n, err := m.Down(ctx, 0); err != nil || n != 11 {
+	if n, err := m.Down(ctx, 0); err != nil || n != 13 {
 		t.Fatalf("down: n=%d err=%v", n, err)
 	}
 	if got := count(tablesQ); got != 0 {
@@ -88,7 +88,7 @@ func TestMigrationsConcurrentUp(t *testing.T) {
 			t.Errorf("up concorrente: %v", err)
 		}
 	}
-	if got := count("SELECT count(*) FROM schema_migrations"); got != 11 {
+	if got := count("SELECT count(*) FROM schema_migrations"); got != 13 {
 		t.Errorf("registros em schema_migrations: %d", got)
 	}
 }

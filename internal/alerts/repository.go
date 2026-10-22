@@ -29,58 +29,13 @@ func (r *Repository) now() time.Time {
 
 func NewRepository(pool *pgxpool.Pool) *Repository { return &Repository{pool: pool} }
 
-const ruleCols = `id, name, metric_name, operator, threshold, severity, duration_seconds, recovery_seconds, server_id, is_enabled, created_at, updated_at`
+const ruleCols = `id, code, name, description, metric_name, operator, threshold, priority, severity, duration_seconds, recovery_seconds, server_id, is_enabled, created_at, updated_at`
 
 func scanRule(row pgx.Row) (Rule, error) {
 	var r Rule
-	err := row.Scan(&r.ID, &r.Name, &r.MetricName, &r.Operator, &r.Threshold, &r.Severity, &r.DurationSeconds,
+	err := row.Scan(&r.ID, &r.Code, &r.Name, &r.Description, &r.MetricName, &r.Operator, &r.Threshold, &r.Priority, &r.Severity, &r.DurationSeconds,
 		&r.RecoverySeconds, &r.ServerID, &r.IsEnabled, &r.CreatedAt, &r.UpdatedAt)
 	return r, err
-}
-
-func (r *Repository) serverExists(ctx context.Context, q interface {
-	QueryRow(context.Context, string, ...any) pgx.Row
-}, id string) error {
-	var ok bool
-	if err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM servers WHERE id = $1 AND deleted_at IS NULL)`, id).Scan(&ok); err != nil {
-		return err
-	}
-	if !ok {
-		return ErrServerNotFound
-	}
-	return nil
-}
-
-func (r *Repository) CreateRule(ctx context.Context, ac audit.Context, in Rule) (Rule, error) {
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return Rule{}, err
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-	if in.ServerID != nil {
-		if err := r.serverExists(ctx, tx, *in.ServerID); err != nil {
-			return Rule{}, err
-		}
-	}
-	out, err := scanRule(tx.QueryRow(ctx, `INSERT INTO alert_rules (name, metric_name, operator, threshold, severity,
-			duration_seconds, recovery_seconds, server_id, is_enabled) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING `+ruleCols,
-		in.Name, in.MetricName, in.Operator, in.Threshold, in.Severity, in.DurationSeconds, in.RecoverySeconds, in.ServerID, in.IsEnabled))
-	if err != nil {
-		return Rule{}, err
-	}
-	if err := audit.Write(ctx, tx, ac, "alert_rule.create", "alert_rule", out.ID, ruleMeta(out)); err != nil {
-		return Rule{}, err
-	}
-	return out, tx.Commit(ctx)
-}
-
-func ruleMeta(r Rule) map[string]any {
-	m := map[string]any{"name": r.Name, "metric": r.MetricName, "operator": r.Operator, "threshold": r.Threshold,
-		"severity": r.Severity, "duration_seconds": r.DurationSeconds, "recovery_seconds": r.RecoverySeconds, "enabled": r.IsEnabled}
-	if r.ServerID != nil {
-		m["server_id"] = *r.ServerID
-	}
-	return m
 }
 
 func (r *Repository) GetRule(ctx context.Context, id string) (Rule, error) {
@@ -91,61 +46,11 @@ func (r *Repository) GetRule(ctx context.Context, id string) (Rule, error) {
 	return out, err
 }
 
-// UpdateRule grava a regra já validada/mesclada (ver UpdateRuleInput.Validate).
-func (r *Repository) UpdateRule(ctx context.Context, ac audit.Context, next Rule) (Rule, error) {
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return Rule{}, err
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-	if next.ServerID != nil {
-		if err := r.serverExists(ctx, tx, *next.ServerID); err != nil {
-			return Rule{}, err
-		}
-	}
-	out, err := scanRule(tx.QueryRow(ctx, `UPDATE alert_rules SET name=$2, metric_name=$3, operator=$4, threshold=$5, severity=$6,
-			duration_seconds=$7, recovery_seconds=$8, server_id=$9, is_enabled=$10, updated_at=now()
-		WHERE id = $1 AND deleted_at IS NULL RETURNING `+ruleCols,
-		next.ID, next.Name, next.MetricName, next.Operator, next.Threshold, next.Severity, next.DurationSeconds,
-		next.RecoverySeconds, next.ServerID, next.IsEnabled))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Rule{}, ErrRuleNotFound
-	}
-	if err != nil {
-		return Rule{}, err
-	}
-	if err := audit.Write(ctx, tx, ac, "alert_rule.update", "alert_rule", out.ID, ruleMeta(out)); err != nil {
-		return Rule{}, err
-	}
-	return out, tx.Commit(ctx)
-}
-
-// DeleteRule faz exclusão lógica; o avaliador resolve os alertas ativos da regra (rule_deleted)
-// no próximo ciclo e o histórico permanece.
-func (r *Repository) DeleteRule(ctx context.Context, ac audit.Context, id string) error {
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-	tag, err := tx.Exec(ctx, `UPDATE alert_rules SET deleted_at = now(), is_enabled = false, updated_at = now() WHERE id = $1 AND deleted_at IS NULL`, id)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrRuleNotFound
-	}
-	if err := audit.Write(ctx, tx, ac, "alert_rule.delete", "alert_rule", id, nil); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
-}
-
 type RuleListParams struct {
 	Page, PerPage int
 	MetricName    string
 	Severity      string
-	ServerID      string
+	Priority      int
 	Enabled       *bool
 }
 
@@ -162,8 +67,8 @@ func (r *Repository) ListRules(ctx context.Context, p RuleListParams) ([]Rule, i
 	if p.Severity != "" {
 		add("severity = ?", p.Severity)
 	}
-	if p.ServerID != "" {
-		add("server_id = ?", p.ServerID)
+	if p.Priority != 0 {
+		add("priority = ?", p.Priority)
 	}
 	if p.Enabled != nil {
 		add("is_enabled = ?", *p.Enabled)
@@ -174,7 +79,7 @@ func (r *Repository) ListRules(ctx context.Context, p RuleListParams) ([]Rule, i
 		return nil, 0, err
 	}
 	args = append(args, p.PerPage, (p.Page-1)*p.PerPage)
-	rows, err := r.pool.Query(ctx, fmt.Sprintf(`SELECT %s FROM alert_rules WHERE %s ORDER BY lower(name), id LIMIT $%d OFFSET $%d`,
+	rows, err := r.pool.Query(ctx, fmt.Sprintf(`SELECT %s FROM alert_rules WHERE %s ORDER BY priority, lower(name), id LIMIT $%d OFFSET $%d`,
 		ruleCols, w, len(args)-1, len(args)), args...)
 	if err != nil {
 		return nil, 0, err
@@ -203,6 +108,7 @@ type Alert struct {
 	ServiceName     *string    `json:"service_name"`
 	IncidentID      *string    `json:"incident_id"`
 	Status          string     `json:"status"`
+	Priority        int        `json:"priority"`
 	Severity        string     `json:"severity"`
 	Message         string     `json:"message"`
 	Value           *float64   `json:"value"`
@@ -214,7 +120,7 @@ type Alert struct {
 	LastEvaluatedAt time.Time  `json:"last_evaluated_at"`
 }
 
-const alertSelect = `SELECT a.id, a.rule_id, r.name, a.server_id, s.name, a.service_id, ms.name, a.incident_id, a.status, a.severity,
+const alertSelect = `SELECT a.id, a.rule_id, r.name, a.server_id, s.name, a.service_id, ms.name, a.incident_id, a.status, r.priority, a.severity,
 		a.message, a.value, a.triggered_at, a.acknowledged_at, a.acknowledged_by::text, a.resolved_at, a.resolved_reason, a.last_evaluated_at
 	FROM alerts a JOIN alert_rules r ON r.id = a.rule_id JOIN servers s ON s.id = a.server_id
 	LEFT JOIN monitored_services ms ON ms.id = a.service_id`
@@ -222,7 +128,7 @@ const alertSelect = `SELECT a.id, a.rule_id, r.name, a.server_id, s.name, a.serv
 func scanAlert(row pgx.Row) (Alert, error) {
 	var a Alert
 	err := row.Scan(&a.ID, &a.RuleID, &a.RuleName, &a.ServerID, &a.ServerName, &a.ServiceID, &a.ServiceName, &a.IncidentID,
-		&a.Status, &a.Severity, &a.Message, &a.Value, &a.TriggeredAt, &a.AcknowledgedAt, &a.AcknowledgedBy, &a.ResolvedAt,
+		&a.Status, &a.Priority, &a.Severity, &a.Message, &a.Value, &a.TriggeredAt, &a.AcknowledgedAt, &a.AcknowledgedBy, &a.ResolvedAt,
 		&a.ResolvedReason, &a.LastEvaluatedAt)
 	return a, err
 }

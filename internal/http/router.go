@@ -170,6 +170,7 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 	dsh := handlers.Discovery{Repo: discRepo, Servers: srvRepo, Log: d.Log}
 	alh := handlers.Alerts{Repo: alertRepo, Log: d.Log, TrustProxy: cfg.TrustProxy}
 	inh := handlers.Incidents{Repo: incRepo, Servers: srvRepo, Log: d.Log}
+	nth := handlers.Notifications{Store: notifications.NewStore(d.Pool), Log: d.Log, TrustProxy: cfg.TrustProxy}
 	chh := handlers.Channels{Repo: chRepo, Log: d.Log, TrustProxy: cfg.TrustProxy}
 	dh := handlers.Dashboard{Dash: dashRepo, Servers: srvRepo, Metrics: metRepo, Log: d.Log}
 	ah := handlers.Auth{Svc: authSvc, Log: d.Log, TrustProxy: cfg.TrustProxy}
@@ -181,6 +182,10 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 	lgh := &handlers.Logs{Pool: d.Pool, Log: d.Log, Entries: d.Metrics.LogEntries}
 	if d.Logs != nil { // evita interface não-nil com ponteiro nil
 		lgh.Store = d.Logs
+	}
+	smh := &handlers.SystemMetrics{Log: d.Log}
+	if d.Logs != nil {
+		smh.Store = d.Logs
 	}
 
 	// Respostas da API nunca são guardadas em cache e há um limite de taxa por IP.
@@ -239,16 +244,18 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 		route("GET", "/services", V, svh.List)
 		route("GET", "/services/{id}", V, svh.Get)
 
-		// regras e alertas
+		// regras (catálogo automático, somente leitura) e alertas
 		route("GET", "/alert-rules", V, alh.ListRules)
-		route("POST", "/alert-rules", O, alh.CreateRule)
 		route("GET", "/alert-rules/{id}", V, alh.GetRule)
-		route("PATCH", "/alert-rules/{id}", O, alh.UpdateRule)
-		route("DELETE", "/alert-rules/{id}", O, alh.DeleteRule)
 		route("GET", "/alerts", V, alh.ListAlerts)
 		route("GET", "/alerts/{id}", V, alh.GetAlert)
 		route("POST", "/alerts/{id}/acknowledge", O, alh.Acknowledge)
 		route("POST", "/alerts/{id}/resolve", O, alh.Resolve)
+
+		// notificações (registro permanente de alertas e IPs banidos)
+		route("GET", "/notifications", V, nth.List)
+		route("POST", "/notifications/read-all", O, nth.MarkAllRead)
+		route("POST", "/notifications/{id}/read", O, nth.MarkRead)
 
 		// incidentes
 		route("GET", "/incidents", V, inh.List)
@@ -296,6 +303,7 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 			{"GET", "/config", handlers.MaxAgentBodyBytes, agh.Config},
 			{"POST", "/discovery", handlers.MaxAgentBodyBytes, agh.PostDiscovery},
 			{"POST", "/logs", handlers.MaxLogBatchBytes, lgh.PostLogs},
+			{"POST", "/system-metrics", handlers.MaxSystemBatchBytes, smh.Post},
 		} {
 			r.With(middleware.BodyLimit(rt.limit)).MethodFunc(rt.m, rt.p, rt.h)
 			d.Registry.add(RouteInfo{Method: rt.m, Path: "/api/v1/agent" + rt.p, Kind: "agent"})

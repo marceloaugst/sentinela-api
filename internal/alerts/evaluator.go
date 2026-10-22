@@ -9,6 +9,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"sentinela/internal/logstore"
+	"sentinela/internal/sysmetrics"
 	"sentinela/internal/telemetry"
 )
 
@@ -20,6 +22,7 @@ type Evaluator struct {
 	Log              *slog.Logger
 	HeartbeatTimeout time.Duration
 	Metrics          *telemetry.Metrics // opcional
+	System           SystemSource       // opcional: métricas de sistema no ClickHouse
 	Now              func() time.Time
 }
 
@@ -37,13 +40,15 @@ func (e *Evaluator) count(action string) {
 }
 
 type serverSnap struct {
-	ID, Name  string
-	LastSeen  *time.Time
-	CPU       *float64
-	Mem       *float64
-	Load      *float64
-	DiskPct   *float64
-	DiskMount string
+	ID, Name   string
+	LastSeen   *time.Time
+	CPU        *float64
+	Mem        *float64
+	Load       *float64
+	LoadPerCPU *float64
+	SwapPct    *float64
+	DiskPct    *float64
+	DiskMount  string
 }
 
 type serviceSnap struct {
@@ -52,9 +57,62 @@ type serviceSnap struct {
 	LastError              string
 }
 
+// SystemSource fornece as métricas de sistema (ClickHouse). Ready=false ou erro = sem dados: nenhum alerta
+// dessas métricas abre nem resolve até o dado voltar.
+type SystemSource interface {
+	Ready() bool
+	LatestSystem(ctx context.Context, window time.Duration) ([]logstore.SystemValue, error)
+}
+
+const systemWindow = 10 * time.Minute
+
+// sysReading é o valor de uma métrica de sistema já reduzido ao pior caso do servidor.
+type sysReading struct {
+	value   float64
+	subject string
+}
+
 type snapshot struct {
 	servers  []serverSnap
 	services []serviceSnap
+	system   map[string]map[string]sysReading // servidor -> métrica da regra -> leitura
+}
+
+// systemMetricMap traduz o nome gravado no ClickHouse para a métrica da regra e diz se vale o pior caso
+// (máximo, ou mínimo para os dias de certificado) ou a soma da janela.
+var systemMetricMap = map[string]struct {
+	rule string
+	mode string // "max" | "min" | "sum" | "last"
+}{
+	sysmetrics.OOMKills:        {MetricOOM, "sum"},
+	sysmetrics.InodeUsed:       {MetricInodes, "max"},
+	sysmetrics.DiskLatency:     {MetricDiskLatency, "max"},
+	sysmetrics.NTPUnsynced:     {MetricNTP, "last"},
+	sysmetrics.SecurityUpdates: {MetricUpdates, "last"},
+	sysmetrics.CertDaysLeft:    {MetricCert, "min"},
+}
+
+func reduceSystem(vals []logstore.SystemValue) map[string]map[string]sysReading {
+	out := map[string]map[string]sysReading{}
+	for _, v := range vals {
+		m, ok := systemMetricMap[v.Metric]
+		if !ok {
+			continue
+		}
+		x := v.Latest
+		if m.mode == "sum" {
+			x = v.Sum
+		}
+		if out[v.ServerID] == nil {
+			out[v.ServerID] = map[string]sysReading{}
+		}
+		cur, has := out[v.ServerID][m.rule]
+		if !has || (m.mode == "max" && x > cur.value) || (m.mode == "min" && x < cur.value) || m.mode == "sum" && x > cur.value ||
+			(m.mode == "last" && x > cur.value) {
+			out[v.ServerID][m.rule] = sysReading{x, v.Subject}
+		}
+	}
+	return out
 }
 
 // loadSnapshot lê, em poucas consultas compartilhadas por todas as regras, o estado atual dos
@@ -62,12 +120,14 @@ type snapshot struct {
 func (e *Evaluator) loadSnapshot(ctx context.Context) (snapshot, error) {
 	var snap snapshot
 	rows, err := e.Pool.Query(ctx, `
-		SELECT s.id, s.name, s.last_seen_at, m.cpu, m.mem_pct, m.load1, d.pct, COALESCE(d.mount, '')
+		SELECT s.id, s.name, s.last_seen_at, m.cpu, m.mem_pct, m.load1, m.load_per_cpu, m.swap_pct, d.pct, COALESCE(d.mount, '')
 		FROM servers s
 		LEFT JOIN LATERAL (
 			SELECT cpu_usage_percent AS cpu,
 			       CASE WHEN memory_total_bytes > 0 THEN memory_used_bytes::float8 / memory_total_bytes * 100 END AS mem_pct,
-			       load_average_1m AS load1
+			       load_average_1m AS load1,
+			       CASE WHEN cpu_count > 0 THEN load_average_1m / cpu_count END AS load_per_cpu,
+			       CASE WHEN swap_total_bytes > 0 THEN swap_used_bytes::float8 / swap_total_bytes * 100 END AS swap_pct
 			FROM server_metrics WHERE server_id = s.id ORDER BY collected_at DESC LIMIT 1) m ON true
 		LEFT JOIN LATERAL (
 			SELECT used_bytes::float8 / total_bytes * 100 AS pct, mount_point AS mount
@@ -79,7 +139,7 @@ func (e *Evaluator) loadSnapshot(ctx context.Context) (snapshot, error) {
 	}
 	for rows.Next() {
 		var s serverSnap
-		if err := rows.Scan(&s.ID, &s.Name, &s.LastSeen, &s.CPU, &s.Mem, &s.Load, &s.DiskPct, &s.DiskMount); err != nil {
+		if err := rows.Scan(&s.ID, &s.Name, &s.LastSeen, &s.CPU, &s.Mem, &s.Load, &s.LoadPerCPU, &s.SwapPct, &s.DiskPct, &s.DiskMount); err != nil {
 			rows.Close()
 			return snap, err
 		}
@@ -88,6 +148,18 @@ func (e *Evaluator) loadSnapshot(ctx context.Context) (snapshot, error) {
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return snap, err
+	}
+
+	if e.System != nil && e.System.Ready() {
+		vals, err := e.System.LatestSystem(ctx, systemWindow)
+		if err != nil {
+			e.Log.Warn("métricas de sistema indisponíveis; regras do ClickHouse mantêm o estado", "err", err)
+		} else {
+			snap.system = reduceSystem(vals)
+			if snap.system == nil {
+				snap.system = map[string]map[string]sysReading{}
+			}
+		}
 	}
 
 	rows, err = e.Pool.Query(ctx, `SELECT ms.id, ms.name, ms.service_type, ms.status, COALESCE(ms.last_error, ''), s.id, s.name
@@ -170,6 +242,21 @@ func (e *Evaluator) targets(rule Rule, snap snapshot, now time.Time) []Target {
 		case MetricLoad:
 			if online && s.Load != nil {
 				t.HasValue, t.Value = true, *s.Load
+			}
+		case MetricLoadPerCPU:
+			if online && s.LoadPerCPU != nil {
+				t.HasValue, t.Value = true, *s.LoadPerCPU
+			}
+		case MetricSwap:
+			if online && s.SwapPct != nil {
+				t.HasValue, t.Value = true, *s.SwapPct
+			}
+		case MetricOOM, MetricInodes, MetricDiskLatency, MetricNTP, MetricUpdates, MetricCert:
+			// snap.system nil = ClickHouse indisponível: sem dados (não abre nem resolve)
+			if r, ok := snap.system[s.ID][rule.MetricName]; online && snap.system != nil {
+				if ok {
+					t.HasValue, t.Value, t.Detail = true, r.value, r.subject
+				}
 			}
 		case MetricDisk:
 			if online && s.DiskPct != nil {

@@ -140,3 +140,21 @@ func (c *Collector) Collect(ctx context.Context, now time.Time) (metrics.Payload
 	}
 	return p, nil
 }
+
+type inodeInfo struct {
+	mount string
+	pct   float64
+}
+
+// inodeUsage calcula o percentual de inodes usados nos mesmos pontos de montagem monitorados no disco.
+func inodeUsage(mounts string) []inodeInfo {
+	var out []inodeInfo
+	for _, m := range ParseMounts(mounts, metrics.MaxDisks) {
+		var st syscall.Statfs_t
+		if err := syscall.Statfs(m.MountPoint, &st); err != nil || st.Files == 0 {
+			continue // sistemas de arquivos sem inodes fixos (btrfs, xfs dinâmico...) reportam 0
+		}
+		out = append(out, inodeInfo{m.MountPoint, float64(st.Files-st.Ffree) / float64(st.Files) * 100})
+	}
+	return out
+}

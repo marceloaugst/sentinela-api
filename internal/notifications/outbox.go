@@ -15,6 +15,7 @@ const (
 	KindTriggered = "triggered"
 	KindResolved  = "resolved"
 	KindTest      = "test"
+	KindIPBanned  = "ip_banned" // fail2ban baniu um IP
 )
 
 var severityRank = map[string]int{"info": 1, "warning": 2, "critical": 3}
@@ -25,12 +26,15 @@ func Rank(sev string) int { return severityRank[sev] }
 // Payload é o conteúdo persistido na fila; a mensagem de texto é montada no envio.
 type Payload struct {
 	Kind        string    `json:"kind"`
+	ServerID    string    `json:"server_id,omitempty"`
 	AlertID     string    `json:"alert_id,omitempty"`
 	IncidentID  string    `json:"incident_id,omitempty"`
 	ServerName  string    `json:"server_name"`
 	ServiceName string    `json:"service_name,omitempty"`
 	RuleName    string    `json:"rule_name"`
 	Severity    string    `json:"severity"`
+	Priority    int       `json:"priority,omitempty"`   // 1 (P1) a 4 (P4); 0 = não informada
+	Recurrence  int       `json:"recurrence,omitempty"` // incidentes anteriores iguais nas últimas 24 h
 	Message     string    `json:"message"`
 	At          time.Time `json:"at"`
 }
@@ -38,10 +42,26 @@ type Payload struct {
 func DedupKey(alertID, kind string) string { return "alert:" + alertID + ":" + kind }
 
 // EnqueueAlert grava, NA TRANSAÇÃO do chamador, uma notificação para cada canal elegível:
-// canal habilitado cujo min_severity (padrão: critical) seja ≤ gravidade do alerta.
+// canal habilitado cujo min_severity (padrão: info, ou seja, todos) seja ≤ gravidade do alerta.
 // O aviso de recuperação só vai a canais que receberam o aviso de disparo.
 func EnqueueAlert(ctx context.Context, tx pgx.Tx, p Payload) error {
-	rows, err := tx.Query(ctx, `SELECT id, COALESCE(config->>'min_severity', 'critical')
+	if err := Record(ctx, tx, p); err != nil {
+		return err
+	}
+	return enqueue(ctx, tx, p, DedupKey(p.AlertID, p.Kind))
+}
+
+// EnqueueEvent registra e enfileira uma notificação que não vem de um alerta (ex.: IP banido).
+// dedupKey impede mensagens repetidas por canal.
+func EnqueueEvent(ctx context.Context, tx pgx.Tx, p Payload, dedupKey string) error {
+	if err := Record(ctx, tx, p); err != nil {
+		return err
+	}
+	return enqueue(ctx, tx, p, dedupKey)
+}
+
+func enqueue(ctx context.Context, tx pgx.Tx, p Payload, dedupKey string) error {
+	rows, err := tx.Query(ctx, `SELECT id, COALESCE(config->>'min_severity', 'info')
 		FROM notification_channels WHERE is_enabled AND channel_type = 'telegram'`)
 	if err != nil {
 		return err
@@ -80,7 +100,7 @@ func EnqueueAlert(ctx context.Context, tx pgx.Tx, p Payload) error {
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO notification_outbox (channel_id, dedup_key, payload)
 			VALUES ($1, $2, $3) ON CONFLICT (channel_id, dedup_key) DO NOTHING`,
-			c.id, DedupKey(p.AlertID, p.Kind), raw); err != nil {
+			c.id, dedupKey, raw); err != nil {
 			return err
 		}
 	}

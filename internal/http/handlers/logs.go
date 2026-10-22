@@ -15,6 +15,7 @@ import (
 	"sentinela/internal/http/response"
 	"sentinela/internal/logs"
 	"sentinela/internal/logstore"
+	"sentinela/internal/notifications"
 	"sentinela/internal/validation"
 )
 
@@ -105,11 +106,13 @@ func (h *Logs) PostLogs(w http.ResponseWriter, r *http.Request) {
 	response.JSON(w, http.StatusOK, map[string]any{"stored": len(b.Entries), "duplicate": false}, nil)
 }
 
-// publishBans anuncia no SSE os bans recentes do fail2ban. Melhor esforço: o lote já foi gravado.
+// publishBans anuncia os bans recentes do fail2ban: grava a notificação no PostgreSQL (registro permanente),
+// enfileira o envio aos canais e publica o evento SSE. Melhor esforço: o lote já foi gravado no ClickHouse.
 func (h *Logs) publishBans(ctx context.Context, serverID string, entries []logs.Entry, now time.Time) {
 	if h.Pool == nil {
 		return
 	}
+	var serverName string
 	sent := 0
 	for _, e := range entries {
 		if e.Source != logs.SourceFail2ban || e.Type != logs.TypeBan || now.Sub(e.Time) > banEventMaxAge {
@@ -123,8 +126,26 @@ func (h *Logs) publishBans(ctx context.Context, serverID string, entries []logs.
 			h.Log.Warn("evento de ban não publicado", "err", err)
 			return
 		}
-		err = events.Publish(ctx, tx, events.TypeSecurityBan, serverID,
-			map[string]any{"ip": e.IP, "jail": e.Fields["jail"], "banned_at": e.Time})
+		if serverName == "" {
+			if err = tx.QueryRow(ctx, `SELECT name FROM servers WHERE id = $1`, serverID).Scan(&serverName); err != nil {
+				_ = tx.Rollback(ctx)
+				h.Log.Warn("evento de ban não publicado", "err", err)
+				return
+			}
+		}
+		jail := e.Fields["jail"]
+		msg := "IP " + e.IP
+		if jail != "" {
+			msg += " banido na jail " + jail
+		}
+		err = notifications.EnqueueEvent(ctx, tx, notifications.Payload{
+			Kind: notifications.KindIPBanned, ServerID: serverID, ServerName: serverName, RuleName: e.IP,
+			Severity: "warning", Priority: 3, Message: msg, At: e.Time,
+		}, "ban:"+serverID+":"+e.IP+":"+e.Time.UTC().Format(time.RFC3339Nano))
+		if err == nil {
+			err = events.Publish(ctx, tx, events.TypeSecurityBan, serverID,
+				map[string]any{"ip": e.IP, "jail": jail, "banned_at": e.Time})
+		}
 		if err == nil {
 			err = tx.Commit(ctx)
 		}

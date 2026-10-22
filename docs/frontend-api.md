@@ -93,7 +93,7 @@ Tipos: `server.status_changed`, `metrics.updated` (opt-in, no máximo 1 a cada 5
 | Detalhe do servidor | `GET /servers/{id}`, `/servers/{id}/summary`, `/servers/{id}/metrics`, `/servers/{id}/disks`, `/servers/{id}/services`, `/servers/{id}/discovery`, `/servers/{id}/incidents` |
 | Cadastro / credencial do agente | `POST /servers`, `PATCH /servers/{id}`, `POST /servers/{id}/agent-credentials` (o token aparece **uma única vez**) |
 | Serviços (descobertos automaticamente, somente leitura) | `GET /services`, `GET /services/{id}` |
-| Alertas e regras | `GET /alerts`, `POST /alerts/{id}/acknowledge`, `POST /alerts/{id}/resolve`, `GET/POST /alert-rules`, `PATCH/DELETE /alert-rules/{id}` |
+| Alertas e regras | `GET /alerts`, `POST /alerts/{id}/acknowledge`, `POST /alerts/{id}/resolve`, `GET /alert-rules`, `GET /alert-rules/{id}` (somente leitura: as regras são automáticas) |
 | Incidentes | `GET /incidents`, `GET /incidents/{id}`, `GET /incidents/{id}/events` |
 | Notificações (Telegram) | `GET/POST /notification-channels`, `PATCH/DELETE /notification-channels/{id}`, `POST /notification-channels/{id}/test` |
 | Administração | `GET/POST /users`, `PATCH /users/{id}`, `POST /users/{id}/sessions/revoke`, `GET /audit-logs` |
@@ -890,7 +890,11 @@ Sugestão de tela: cartão verde para `available` (mostrando `source`) e cartão
 - `429` — Limite de requisições excedido (RATE_LIMITED); veja o cabeçalho Retry-After
 
 ### `GET /api/v1/alert-rules`
-**Lista regras de alerta** — papel mínimo: **viewer**
+**Lista as regras automáticas de alerta (somente leitura)** — papel mínimo: **viewer**
+
+As regras vêm de um catálogo fixo (CPU, RAM, swap, load, disco, servidor sem comunicação, serviço indisponível)
+sincronizado com o PostgreSQL a cada inicialização da API. Não há cadastro, edição nem exclusão pela API.
+Ordenadas por prioridade (P1 primeiro).
 
 **Parâmetros**
 
@@ -900,7 +904,7 @@ Sugestão de tela: cartão verde para `available` (mostrando `source`) e cartão
 | `per_page` | query | integer padrão 20 máx 100 |  |  |
 | `metric_name` | query | MetricName |  |  |
 | `severity` | query | Severity |  |  |
-| `server_id` | query | string(uuid) |  |  |
+| `priority` | query | `1` \| `2` \| `3` \| `4` |  |  |
 | `enabled` | query | boolean |  |  |
 
 **Respostas**
@@ -911,43 +915,6 @@ Sugestão de tela: cartão verde para `available` (mostrando `source`) e cartão
 |---|---|---|---|
 | `data` | AlertRule[] | sim |  |
 | `meta` | PageMeta | sim |  |
-
-- `401` — Credencial ausente, inválida, expirada ou revogada
-- `403` — Papel insuficiente (FORBIDDEN), token CSRF ausente/inválido (CSRF_INVALID) ou origem não permitida (ORIGIN_NOT_ALLOWED)
-- `422` — Dados inválidos (VALIDATION_ERROR) com detalhes por campo
-- `429` — Limite de requisições excedido (RATE_LIMITED); veja o cabeçalho Retry-After
-
-### `POST /api/v1/alert-rules`
-**Cria uma regra de alerta** — papel mínimo: **operator**
-
-`duration_seconds`: tempo mínimo em que a condição deve persistir antes de abrir o alerta (0 = imediato).
-`recovery_seconds`: tempo mínimo com a condição normalizada antes de resolver (0 = imediato).
-`server_id` omitido = regra global (todos os servidores ativos).
-Métricas: `cpu_usage_percent`, `memory_used_percent`, `disk_used_percent` (pior volume), `load_average_1m`,
-`server_offline` (segundos sem comunicação; operador `>` ou `>=`) e `service_down` (operador `==`, limiar `1`).
-Não há regras pré-criadas: os exemplos do projeto (CPU > 90%, RAM > 90%, disco > 85%...) precisam ser cadastrados.
-
-**Corpo (application/json)**
-
-| Campo | Tipo | Obrig. | Descrição |
-|---|---|---|---|
-| `name` | string | sim |  |
-| `metric_name` | MetricName | sim |  |
-| `operator` | `>` \| `>=` \| `<` \| `<=` \| `==` | sim |  |
-| `threshold` | number | sim |  |
-| `severity` | Severity | sim |  |
-| `duration_seconds` | integer |  |  |
-| `recovery_seconds` | integer |  |  |
-| `server_id` | string(uuid) \| null |  | Omitido = global |
-| `is_enabled` | boolean |  |  |
-
-**Respostas**
-
-- `201` — Criada
-
-| Campo | Tipo | Obrig. | Descrição |
-|---|---|---|---|
-| `data` | AlertRule |  |  |
 
 - `401` — Credencial ausente, inválida, expirada ou revogada
 - `403` — Papel insuficiente (FORBIDDEN), token CSRF ausente/inválido (CSRF_INVALID) ou origem não permitida (ORIGIN_NOT_ALLOWED)
@@ -971,64 +938,6 @@ Não há regras pré-criadas: os exemplos do projeto (CPU > 90%, RAM > 90%, disc
 |---|---|---|---|
 | `data` | AlertRule |  |  |
 
-- `400` — Identificador inválido (INVALID_ID)
-- `401` — Credencial ausente, inválida, expirada ou revogada
-- `403` — Papel insuficiente (FORBIDDEN), token CSRF ausente/inválido (CSRF_INVALID) ou origem não permitida (ORIGIN_NOT_ALLOWED)
-- `404` — Recurso não encontrado
-- `429` — Limite de requisições excedido (RATE_LIMITED); veja o cabeçalho Retry-After
-
-### `PATCH /api/v1/alert-rules/{id}`
-**Altera a regra (o conjunto resultante é revalidado)** — papel mínimo: **operator**
-
-Desativar a regra resolve seus alertas ativos (motivo `rule_disabled`) no próximo ciclo de avaliação.
-
-**Parâmetros**
-
-| Nome | Em | Tipo | Obrig. | Descrição |
-|---|---|---|---|---|
-| `id` | path | string(uuid) | sim |  |
-
-**Corpo (application/json)**
-
-| Campo | Tipo | Obrig. | Descrição |
-|---|---|---|---|
-| `name` | string |  |  |
-| `metric_name` | MetricName |  |  |
-| `operator` | `>` \| `>=` \| `<` \| `<=` \| `==` |  |  |
-| `threshold` | number |  |  |
-| `severity` | Severity |  |  |
-| `duration_seconds` | integer |  |  |
-| `recovery_seconds` | integer |  |  |
-| `server_id` | string(uuid) |  | Não é possível voltar a global por PATCH; recrie a regra |
-| `is_enabled` | boolean |  |  |
-
-**Respostas**
-
-- `200` — Regra atualizada
-
-| Campo | Tipo | Obrig. | Descrição |
-|---|---|---|---|
-| `data` | AlertRule |  |  |
-
-- `400` — Identificador inválido (INVALID_ID)
-- `401` — Credencial ausente, inválida, expirada ou revogada
-- `403` — Papel insuficiente (FORBIDDEN), token CSRF ausente/inválido (CSRF_INVALID) ou origem não permitida (ORIGIN_NOT_ALLOWED)
-- `404` — Recurso não encontrado
-- `422` — Dados inválidos (VALIDATION_ERROR) com detalhes por campo
-- `429` — Limite de requisições excedido (RATE_LIMITED); veja o cabeçalho Retry-After
-
-### `DELETE /api/v1/alert-rules/{id}`
-**Remove a regra (exclusão lógica; o histórico de alertas permanece)** — papel mínimo: **operator**
-
-**Parâmetros**
-
-| Nome | Em | Tipo | Obrig. | Descrição |
-|---|---|---|---|---|
-| `id` | path | string(uuid) | sim |  |
-
-**Respostas**
-
-- `204` — Removida
 - `400` — Identificador inválido (INVALID_ID)
 - `401` — Credencial ausente, inválida, expirada ou revogada
 - `403` — Papel insuficiente (FORBIDDEN), token CSRF ausente/inválido (CSRF_INVALID) ou origem não permitida (ORIGIN_NOT_ALLOWED)
@@ -1181,6 +1090,29 @@ Se a condição ainda existir, o avaliador abrirá um novo alerta quando voltar 
 - `404` — Recurso não encontrado
 - `422` — Dados inválidos (VALIDATION_ERROR) com detalhes por campo
 - `429` — Limite de requisições excedido (RATE_LIMITED); veja o cabeçalho Retry-After
+
+### `GET /api/v1/notifications`
+**Registro permanente de notificações (alertas disparados e recuperados, IPs banidos)** — papel mínimo: **viewer**
+
+Toda notificação gerada fica gravada no PostgreSQL, com ou sem canal externo (Telegram) e independentemente da entrega.
+Mais recentes primeiro. `meta.unread` traz o total de não lidas (todas, ignorando os filtros).
+
+| Nome | Em | Tipo | Descrição |
+|---|---|---|---|
+| `page`, `per_page` | query | integer | Paginação |
+| `kind` | query | `alert_triggered` \| `alert_resolved` \| `ip_banned` |  |
+| `priority` | query | `1`–`4` |  |
+| `server_id` | query | string(uuid) |  |
+| `unread` | query | boolean |  |
+| `from`, `to` | query | string(date-time) |  |
+
+Resposta `200`: `data` = Notification[], `meta` = PageMeta + `unread`.
+
+### `POST /api/v1/notifications/{id}/read`
+**Marca uma notificação como lida (idempotente)** — papel mínimo: **operator**. `200` com a Notification; `404` se não existir.
+
+### `POST /api/v1/notifications/read-all`
+**Marca todas como lidas** — papel mínimo: **operator**. `200` com `{ "marked": n }`.
 
 ### `GET /api/v1/incidents`
 **Lista incidentes (mais recentes primeiro)** — papel mínimo: **viewer**
@@ -1901,7 +1833,7 @@ Tipo: `info` \| `warning` \| `critical`
 
 ### MetricName
 
-Tipo: `cpu_usage_percent` \| `memory_used_percent` \| `disk_used_percent` \| `load_average_1m` \| `server_offline` \| `service_down`
+Tipo: `cpu_usage_percent` \| `memory_used_percent` \| `disk_used_percent` \| `load_average_1m` \| `server_offline` \| `service_down` \| `swap_used_percent` \| `load_per_cpu` \| `oom_kills_10m` \| `inode_used_percent` \| `disk_latency_ms` \| `ntp_unsynchronized` \| `security_updates` \| `cert_days_left`
 
 ### ServiceConfig
 
@@ -1932,37 +1864,44 @@ Mantido por compatibilidade; sem efeito (os serviços são descobertos automatic
 | `created_at` | string(date-time) |  |  |
 | `updated_at` | string(date-time) |  |  |
 
-### CreateAlertRule
+### AlertRule
 
 | Campo | Tipo | Obrig. | Descrição |
 |---|---|---|---|
-| `name` | string | sim |  |
-| `metric_name` | MetricName | sim |  |
-| `operator` | `>` \| `>=` \| `<` \| `<=` \| `==` | sim |  |
-| `threshold` | number | sim |  |
-| `severity` | Severity | sim |  |
-| `duration_seconds` | integer |  |  |
-| `recovery_seconds` | integer |  |  |
-| `server_id` | string(uuid) \| null |  | Omitido = global |
-| `is_enabled` | boolean |  |  |
-
-### UpdateAlertRule
-
-| Campo | Tipo | Obrig. | Descrição |
-|---|---|---|---|
+| `id` | string(uuid) |  |  |
+| `code` | string \| null |  | Identificador estável da regra do catálogo |
 | `name` | string |  |  |
+| `description` | string |  |  |
 | `metric_name` | MetricName |  |  |
 | `operator` | `>` \| `>=` \| `<` \| `<=` \| `==` |  |  |
 | `threshold` | number |  |  |
+| `priority` | Priority |  |  |
 | `severity` | Severity |  |  |
-| `duration_seconds` | integer |  |  |
-| `recovery_seconds` | integer |  |  |
-| `server_id` | string(uuid) |  | Não é possível voltar a global por PATCH; recrie a regra |
+| `duration_seconds` | integer |  | Tempo com a condição verdadeira antes de alertar |
+| `recovery_seconds` | integer |  | Tempo com a condição normalizada antes de resolver |
+| `server_id` | string(uuid) \| null |  | Sempre nulo; as regras valem para todos os servidores |
 | `is_enabled` | boolean |  |  |
+| `created_at` | string(date-time) |  |  |
+| `updated_at` | string(date-time) |  |  |
 
-### AlertRule
+### Notification
 
-Tipo: any
+| Campo | Tipo | Descrição |
+|---|---|---|
+| `id` | integer(int64) |  |
+| `kind` | `alert_triggered` \| `alert_resolved` \| `ip_banned` |  |
+| `priority` | Priority | Recuperação = 4; IP banido = 3 |
+| `severity` | Severity |  |
+| `server_id`, `server_name` | string \| null |  |
+| `alert_id`, `incident_id` | string(uuid) \| null |  |
+| `title`, `message` | string |  |
+| `data` | object | Cópia do conteúdo enviado |
+| `created_at` | string(date-time) |  |
+| `read_at` | string(date-time) \| null |  |
+
+### Priority
+
+Inteiro `1`–`4`: P1 crítico (notificação imediata), P2 alto, P3 atenção (aparece no painel), P4 informativo (histórico). P1 e P2 têm severidade `critical`, P3 `warning` e P4 `info`.
 
 ### Alert
 
@@ -1977,6 +1916,7 @@ Tipo: any
 | `service_name` | string \| null |  |  |
 | `incident_id` | string(uuid) \| null |  |  |
 | `status` | `firing` \| `acknowledged` \| `resolved` |  |  |
+| `priority` | Priority |  |  |
 | `severity` | Severity |  |  |
 | `message` | string |  |  |
 | `value` | number \| null |  |  |
@@ -2000,6 +1940,8 @@ Tipo: any
 | `service_name` | string \| null |  |  |
 | `title` | string |  |  |
 | `severity` | Severity |  |  |
+| `priority` | Priority |  |  |
+| `recurrence_count` | integer |  | Incidentes iguais (mesmo servidor, regra e serviço) resolvidos nas 24 h anteriores; maior que 0 = reincidente |
 | `status` | `open` \| `resolved` |  |  |
 | `started_at` | string(date-time) |  |  |
 | `resolved_at` | string(date-time) \| null |  |  |

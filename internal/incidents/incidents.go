@@ -33,6 +33,8 @@ type Incident struct {
 	ServiceName     *string    `json:"service_name"`
 	Title           string     `json:"title"`
 	Severity        string     `json:"severity"`
+	Priority        int        `json:"priority"`         // 1 (P1, crítico) a 4 (P4, informativo)
+	RecurrenceCount int        `json:"recurrence_count"` // incidentes iguais resolvidos nas 24 h anteriores à abertura
 	Status          string     `json:"status"`
 	StartedAt       time.Time  `json:"started_at"`
 	ResolvedAt      *time.Time `json:"resolved_at"`
@@ -60,7 +62,7 @@ type Detail struct {
 	Alerts []AlertRef `json:"alerts"`
 }
 
-const sel = `SELECT i.id, i.server_id, s.name, i.rule_id, r.name, i.service_id, ms.name, i.title, i.severity, i.status,
+const sel = `SELECT i.id, i.server_id, s.name, i.rule_id, r.name, i.service_id, ms.name, i.title, i.severity, i.priority, i.recurrence_count, i.status,
 		i.started_at, i.resolved_at, extract(epoch FROM coalesce(i.resolved_at, now()) - i.started_at)::bigint
 	FROM incidents i LEFT JOIN servers s ON s.id = i.server_id LEFT JOIN alert_rules r ON r.id = i.rule_id
 	LEFT JOIN monitored_services ms ON ms.id = i.service_id`
@@ -68,7 +70,7 @@ const sel = `SELECT i.id, i.server_id, s.name, i.rule_id, r.name, i.service_id, 
 func scan(row pgx.Row) (Incident, error) {
 	var i Incident
 	err := row.Scan(&i.ID, &i.ServerID, &i.ServerName, &i.RuleID, &i.RuleName, &i.ServiceID, &i.ServiceName, &i.Title,
-		&i.Severity, &i.Status, &i.StartedAt, &i.ResolvedAt, &i.DurationSeconds)
+		&i.Severity, &i.Priority, &i.RecurrenceCount, &i.Status, &i.StartedAt, &i.ResolvedAt, &i.DurationSeconds)
 	return i, err
 }
 
@@ -76,6 +78,7 @@ type ListParams struct {
 	Page, PerPage int
 	Status        string
 	Severity      string
+	Priority      int
 	ServerID      string
 	From, To      *time.Time // filtro por started_at
 }
@@ -92,6 +95,9 @@ func (r *Repository) List(ctx context.Context, p ListParams) ([]Incident, int, e
 	}
 	if p.Severity != "" {
 		add("i.severity = ?", p.Severity)
+	}
+	if p.Priority != 0 {
+		add("i.priority = ?", p.Priority)
 	}
 	if p.ServerID != "" {
 		add("i.server_id = ?", p.ServerID)

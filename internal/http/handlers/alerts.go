@@ -22,10 +22,6 @@ func (h Alerts) fail(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, alerts.ErrRuleNotFound), errors.Is(err, alerts.ErrAlertNotFound):
 		response.NotFound(w)
-	case errors.Is(err, alerts.ErrServerNotFound):
-		var p validation.Problems
-		p.Add("server_id", "servidor não encontrado")
-		response.Validation(w, p)
 	case errors.Is(err, alerts.ErrInvalidState):
 		response.Error(w, http.StatusConflict, "INVALID_STATE", "O estado atual do alerta não permite esta operação.")
 	default:
@@ -34,19 +30,26 @@ func (h Alerts) fail(w http.ResponseWriter, err error) {
 	}
 }
 
-// ---- regras ----
+// ---- regras (catálogo automático, somente leitura) ----
+
+// priorityParam lê o filtro ?priority=1..4 (0 = sem filtro).
+func priorityParam(p *validation.Problems, v string) int {
+	switch v {
+	case "":
+		return 0
+	case "1", "2", "3", "4":
+		return int(v[0] - '0')
+	}
+	p.Add("priority", "deve ser 1, 2, 3 ou 4")
+	return 0
+}
 
 func (h Alerts) ListRules(w http.ResponseWriter, r *http.Request) {
 	var p validation.Problems
 	page, per := pagination(r, &p)
 	q := r.URL.Query()
 	lp := alerts.RuleListParams{Page: page, PerPage: per, MetricName: q.Get("metric_name"), Severity: q.Get("severity")}
-	if v := q.Get("server_id"); v != "" {
-		if !uuidRe.MatchString(v) {
-			p.Add("server_id", "deve ser um UUID")
-		}
-		lp.ServerID = strings.ToLower(v)
-	}
+	lp.Priority = priorityParam(&p, q.Get("priority"))
 	if v := q.Get("enabled"); v != "" {
 		switch v {
 		case "true":
@@ -71,25 +74,6 @@ func (h Alerts) ListRules(w http.ResponseWriter, r *http.Request) {
 	response.JSON(w, http.StatusOK, list, newPageMeta(page, per, total))
 }
 
-func (h Alerts) CreateRule(w http.ResponseWriter, r *http.Request) {
-	var in alerts.CreateRuleInput
-	if !response.Decode(w, r, &in) {
-		return
-	}
-	rule, p := in.Validate()
-	if len(p) > 0 {
-		response.Validation(w, p)
-		return
-	}
-	out, err := h.Repo.CreateRule(r.Context(), auditCtx(r, h.TrustProxy), rule)
-	if err != nil {
-		h.fail(w, err)
-		return
-	}
-	w.Header().Set("Location", "/api/v1/alert-rules/"+out.ID)
-	response.JSON(w, http.StatusCreated, out, nil)
-}
-
 func (h Alerts) GetRule(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathUUID(w, r, "id")
 	if !ok {
@@ -101,45 +85,6 @@ func (h Alerts) GetRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response.JSON(w, http.StatusOK, out, nil)
-}
-
-func (h Alerts) UpdateRule(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathUUID(w, r, "id")
-	if !ok {
-		return
-	}
-	var in alerts.UpdateRuleInput
-	if !response.Decode(w, r, &in) {
-		return
-	}
-	cur, err := h.Repo.GetRule(r.Context(), id)
-	if err != nil {
-		h.fail(w, err)
-		return
-	}
-	next, p := in.Validate(cur)
-	if len(p) > 0 {
-		response.Validation(w, p)
-		return
-	}
-	out, err := h.Repo.UpdateRule(r.Context(), auditCtx(r, h.TrustProxy), next)
-	if err != nil {
-		h.fail(w, err)
-		return
-	}
-	response.JSON(w, http.StatusOK, out, nil)
-}
-
-func (h Alerts) DeleteRule(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathUUID(w, r, "id")
-	if !ok {
-		return
-	}
-	if err := h.Repo.DeleteRule(r.Context(), auditCtx(r, h.TrustProxy), id); err != nil {
-		h.fail(w, err)
-		return
-	}
-	response.NoContent(w)
 }
 
 // ---- alertas ----

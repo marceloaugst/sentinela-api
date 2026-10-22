@@ -60,26 +60,57 @@ func addEvent(ctx context.Context, tx pgx.Tx, incidentID, typ, msg string, now t
 	return err
 }
 
+// recurrenceWindow: incidentes iguais dentro dessa janela contam como reincidência.
+const recurrenceWindow = 24 * time.Hour
+
 // findOrCreateIncident garante no máximo um incidente ABERTO por (servidor, regra, serviço):
-// uma falha contínua reutiliza o mesmo incidente em vez de criar vários.
-func findOrCreateIncident(ctx context.Context, tx pgx.Tx, rule Rule, t Target, now time.Time) (id string, created bool, err error) {
-	err = tx.QueryRow(ctx, `SELECT id FROM incidents WHERE status = 'open' AND server_id = $1 AND rule_id = $2
-		AND service_id IS NOT DISTINCT FROM $3::uuid`, t.ServerID, rule.ID, t.ServiceID).Scan(&id)
+// uma falha contínua reutiliza o mesmo incidente em vez de criar vários. Ao abrir um novo, conta
+// quantos incidentes iguais foram resolvidos nas últimas 24 h (reincidência).
+func findOrCreateIncident(ctx context.Context, tx pgx.Tx, rule Rule, t Target, now time.Time) (id string, recurrence int, created bool, err error) {
+	var cur int
+	err = tx.QueryRow(ctx, `SELECT id, recurrence_count FROM incidents WHERE status = 'open' AND server_id = $1 AND rule_id = $2
+		AND service_id IS NOT DISTINCT FROM $3::uuid`, t.ServerID, rule.ID, t.ServiceID).Scan(&id, &cur)
 	if err == nil {
-		return id, false, nil
+		return id, cur, false, nil
 	}
 	if err != pgx.ErrNoRows {
-		return "", false, err
+		return "", 0, false, err
 	}
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM incidents WHERE status = 'resolved' AND server_id = $1 AND rule_id = $2
+		AND service_id IS NOT DISTINCT FROM $3::uuid AND resolved_at >= $4`,
+		t.ServerID, rule.ID, t.ServiceID, now.Add(-recurrenceWindow)).Scan(&recurrence); err != nil {
+		return "", 0, false, err
+	}
+	title := incidentTitle(rule, t)
+	if err := tx.QueryRow(ctx, `INSERT INTO incidents (server_id, rule_id, service_id, title, severity, priority, recurrence_count, started_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`, t.ServerID, rule.ID, t.ServiceID, title, rule.Severity, priorityOf(rule), recurrence, now).Scan(&id); err != nil {
+		return "", 0, false, err
+	}
+	if err := addEvent(ctx, tx, id, "opened", fmt.Sprintf("Incidente aberto (P%d): %s", priorityOf(rule), title), now); err != nil {
+		return "", 0, false, err
+	}
+	if recurrence > 0 {
+		if err := addEvent(ctx, tx, id, "recurrent", fmt.Sprintf("Reincidente: %d incidente(s) igual(is) resolvido(s) nas últimas 24 h", recurrence), now); err != nil {
+			return "", 0, false, err
+		}
+	}
+	return id, recurrence, true, nil
+}
+
+func incidentTitle(rule Rule, t Target) string {
 	title := rule.Name + " — " + t.ServerName
 	if t.ServiceName != "" {
 		title += " / " + t.ServiceName
 	}
-	if err := tx.QueryRow(ctx, `INSERT INTO incidents (server_id, rule_id, service_id, title, severity, started_at)
-		VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`, t.ServerID, rule.ID, t.ServiceID, title, rule.Severity, now).Scan(&id); err != nil {
-		return "", false, err
+	return title
+}
+
+// priorityOf: regras sem prioridade (anteriores ao catálogo) valem P3.
+func priorityOf(r Rule) int {
+	if r.Priority < P1 || r.Priority > P4 {
+		return P3
 	}
-	return id, true, addEvent(ctx, tx, id, "opened", "Incidente aberto: "+title, now)
+	return r.Priority
 }
 
 // ---- eventos em tempo real (sem segredos, alvos nem hostnames) ----
@@ -109,6 +140,8 @@ type incidentEvent struct {
 	RuleName    string     `json:"rule_name"`
 	Title       string     `json:"title"`
 	Severity    string     `json:"severity"`
+	Priority    int        `json:"priority"`
+	Recurrence  int        `json:"recurrence_count"`
 	Status      string     `json:"status"`
 	StartedAt   time.Time  `json:"started_at"`
 	ResolvedAt  *time.Time `json:"resolved_at,omitempty"`
@@ -131,7 +164,7 @@ func fire(ctx context.Context, tx pgx.Tx, rule Rule, t Target, existing *alertRo
 		rule.ID, t.ServerID, t.ServiceID, rule.Severity, msg, t.Value, now).Scan(&alertID); err != nil {
 		return err
 	}
-	incID, createdIncident, err := findOrCreateIncident(ctx, tx, rule, t, now)
+	incID, recurrence, createdIncident, err := findOrCreateIncident(ctx, tx, rule, t, now)
 	if err != nil {
 		return err
 	}
@@ -142,21 +175,18 @@ func fire(ctx context.Context, tx pgx.Tx, rule Rule, t Target, existing *alertRo
 		return err
 	}
 	if err := notifications.EnqueueAlert(ctx, tx, notifications.Payload{
-		Kind: notifications.KindTriggered, AlertID: alertID, IncidentID: incID,
+		Kind: notifications.KindTriggered, ServerID: t.ServerID, AlertID: alertID, IncidentID: incID,
 		ServerName: t.ServerName, ServiceName: t.ServiceName, RuleName: rule.Name,
-		Severity: rule.Severity, Message: msg, At: now,
+		Severity: rule.Severity, Priority: priorityOf(rule), Recurrence: recurrence, Message: msg, At: now,
 	}); err != nil {
 		return err
 	}
 	// Eventos por ÚLTIMO (ver events.Publish): incidente primeiro, depois o alerta.
 	if createdIncident {
-		title := rule.Name + " — " + t.ServerName
-		if t.ServiceName != "" {
-			title += " / " + t.ServiceName
-		}
+		title := incidentTitle(rule, t)
 		if err := events.Publish(ctx, tx, events.TypeIncidentCreated, t.ServerID, incidentEvent{
 			IncidentID: incID, ServerID: t.ServerID, ServerName: t.ServerName, ServiceID: t.ServiceID, ServiceName: t.ServiceName,
-			RuleID: rule.ID, RuleName: rule.Name, Title: title, Severity: rule.Severity, Status: "open", StartedAt: now,
+			RuleID: rule.ID, RuleName: rule.Name, Title: title, Severity: rule.Severity, Priority: priorityOf(rule), Recurrence: recurrence, Status: "open", StartedAt: now,
 		}); err != nil {
 			return err
 		}
@@ -222,7 +252,7 @@ func resolve(ctx context.Context, tx pgx.Tx, a alertRow, reason, actor string, n
 	if a.IncidentID != nil {
 		incID = *a.IncidentID
 		if err := notifications.EnqueueAlert(ctx, tx, notifications.Payload{
-			Kind: notifications.KindResolved, AlertID: a.ID, IncidentID: incID, ServerName: serverName, ServiceName: svc,
+			Kind: notifications.KindResolved, ServerID: a.ServerID, AlertID: a.ID, IncidentID: incID, ServerName: serverName, ServiceName: svc,
 			RuleName: ruleName, Severity: a.Severity, Message: fmt.Sprintf("Condição normalizada. Alerta original: %s", a.Message), At: now,
 		}); err != nil {
 			return err
@@ -240,12 +270,13 @@ func resolve(ctx context.Context, tx pgx.Tx, a alertRow, reason, actor string, n
 		return nil
 	}
 	var title, sev string
+	var prio, recurrence int
 	var started time.Time
-	if err := tx.QueryRow(ctx, `SELECT title, severity, started_at FROM incidents WHERE id = $1`, incID).Scan(&title, &sev, &started); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT title, severity, priority, recurrence_count, started_at FROM incidents WHERE id = $1`, incID).Scan(&title, &sev, &prio, &recurrence, &started); err != nil {
 		return err
 	}
 	return events.Publish(ctx, tx, events.TypeIncidentResolved, a.ServerID, incidentEvent{
 		IncidentID: incID, ServerID: a.ServerID, ServerName: serverName, ServiceID: a.ServiceID, ServiceName: svc,
-		RuleID: a.RuleID, RuleName: ruleName, Title: title, Severity: sev, Status: "resolved", StartedAt: started, ResolvedAt: &now,
+		RuleID: a.RuleID, RuleName: ruleName, Title: title, Severity: sev, Priority: prio, Recurrence: recurrence, Status: "resolved", StartedAt: started, ResolvedAt: &now,
 	})
 }

@@ -44,6 +44,7 @@ func (h Incidents) params(r *http.Request, p *validation.Problems) incidents.Lis
 	default:
 		p.Add("severity", "deve ser info, warning ou critical")
 	}
+	lp.Priority = priorityParam(p, q.Get("priority"))
 	if v := q.Get("server_id"); v != "" {
 		if !uuidRe.MatchString(v) {
 			p.Add("server_id", "deve ser um UUID")

@@ -101,4 +101,6 @@
 | 0002 | servers, agent_credentials |
 | 0003 | server_metrics, server_disks |
 | 0004 | monitored_services, alert_rules, incidents, incident_events, alerts |
+| 0012 | alertas automáticos: `alert_rules.code/description/priority`, `incidents.priority/recurrence_count` |
+| 0013 | tabela `notifications` (registro permanente) e métricas de sistema no catálogo de alertas |
 | 0005 | notification_channels, notification_outbox, audit_logs |

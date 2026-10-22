@@ -176,11 +176,7 @@ func fireAlert(e *env, name string) (serverID, ruleID string) {
 	serverID = e.createServer(name)
 	e.sample(serverID, time.Now().UTC(), 97, 4, 500, 1000, nil, nil)
 	e.exec(`UPDATE servers SET last_seen_at = now() WHERE id=$1`, serverID)
-	r := e.post("/api/v1/alert-rules", map[string]any{"name": "CPU alta", "metric_name": "cpu_usage_percent", "operator": ">", "threshold": 90, "severity": "critical", "server_id": serverID})
-	if r.Status != 201 {
-		e.t.Fatalf("regra: %d %s", r.Status, r.Raw)
-	}
-	return serverID, r.data()["id"].(string)
+	return serverID, e.rule("CPU alta", "cpu_usage_percent", ">", 90, "critical", 0, serverID)
 }
 
 func TestStreamRequiresAdminAuthAndValidatesParameters(t *testing.T) {

@@ -191,7 +191,7 @@ func TestOpenAPIRequiredRolesMatchTheRouter(t *testing.T) {
 		}
 		n++
 	}
-	if n < 55 {
+	if n < 50 {
 		t.Errorf("apenas %d rotas comparadas", n)
 	}
 }

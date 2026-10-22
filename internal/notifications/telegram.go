@@ -101,8 +101,18 @@ func FormatText(p Payload) string {
 	if p.Kind == KindTest {
 		return "🔔 Teste do Sentinela: o canal de notificações está funcionando."
 	}
+	if p.Kind == KindIPBanned {
+		return fmt.Sprintf("🚫 [P3 · aviso] %s\nIP banido pelo fail2ban: %s\n%s\nHorário: %s", p.ServerName, p.RuleName, p.Message,
+			p.At.UTC().Format("2006-01-02 15:04:05 UTC"))
+	}
 	icon, label := map[string]string{"critical": "🔴", "warning": "🟠", "info": "🔵"}[p.Severity], strings.ToUpper(sevPT(p.Severity))
+	if p.Priority > 0 {
+		label = fmt.Sprintf("P%d · %s", p.Priority, label)
+	}
 	head := fmt.Sprintf("%s [%s] %s", icon, label, p.ServerName)
+	if p.Recurrence > 0 && p.Kind != KindResolved {
+		head += fmt.Sprintf(" (reincidente: %d× em 24 h)", p.Recurrence)
+	}
 	when := "Início"
 	if p.Kind == KindResolved {
 		head = fmt.Sprintf("✅ [RECUPERADO] %s", p.ServerName)

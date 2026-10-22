@@ -296,7 +296,7 @@ func TestAuthorizationMatrixCoversEveryRoute(t *testing.T) {
 	}
 
 	routes := append([]apphttpRoute(nil), registryRoutes(e)...)
-	if len(routes) < 55 {
+	if len(routes) < 50 {
 		t.Fatalf("poucas rotas registradas (%d): o registro deveria cobrir toda a API", len(routes))
 	}
 	checked := map[string]int{}
@@ -355,7 +355,7 @@ func TestAuthorizationMatrixCoversEveryRoute(t *testing.T) {
 		}
 	}
 	t.Logf("matriz: %d rotas; verificações %v", len(routes), checked)
-	if checked["negado"] < 40 || checked["permitido"] < 100 || checked["agent"] != 5 {
+	if checked["negado"] < 35 || checked["permitido"] < 90 || checked["agent"] != 6 {
 		t.Errorf("cobertura da matriz: %v", checked)
 	}
 
@@ -376,7 +376,7 @@ func TestAuthorizationMatrixCoversEveryRoute(t *testing.T) {
 	}
 	// papéis de cada categoria de recurso (documenta a política)
 	want := map[string]auth.Role{
-		"GET /api/v1/servers": auth.Viewer, "POST /api/v1/servers": auth.Admin, "POST /api/v1/alert-rules": auth.Operator,
+		"GET /api/v1/servers": auth.Viewer, "POST /api/v1/servers": auth.Admin,
 		"POST /api/v1/alerts/{id}/acknowledge": auth.Operator, "GET /api/v1/notification-channels": auth.Admin,
 		"GET /api/v1/servers/{id}/agent-credentials": auth.Admin, "GET /api/v1/users": auth.Admin, "GET /api/v1/audit-logs": auth.Admin,
 		"GET /api/v1/events": auth.Viewer,
@@ -502,13 +502,14 @@ func TestUsersAPI(t *testing.T) {
 	bi := &actor{e: e, t: t, Email: "bia@exemplo.com", Password: "violeta-quente-rio-2026", client: &nethttp.Client{}}
 	bi.client.Jar, _ = cookiejar.New(nil)
 	bi.mustLogin()
-	if r := bi.do("POST", "/api/v1/alert-rules", `{}`); r.Status != 422 { // operador passa da autorização
-		t.Fatalf("operador cria regra: %d", r.Status)
+	zero := "00000000-0000-0000-0000-000000000000"
+	if r := bi.do("POST", "/api/v1/alerts/"+zero+"/acknowledge", `{}`); r.Status != 404 { // operador passa da autorização
+		t.Fatalf("operador reconhece alerta: %d", r.Status)
 	}
 	if r := admin.do("PATCH", "/api/v1/users/"+bia, map[string]string{"role": "viewer"}); r.Status != 200 {
 		t.Fatal(r.Raw)
 	}
-	if r := bi.do("POST", "/api/v1/alert-rules", `{}`); r.Status != 403 {
+	if r := bi.do("POST", "/api/v1/alerts/"+zero+"/acknowledge", `{}`); r.Status != 403 {
 		t.Errorf("após o rebaixamento, a MESMA sessão deveria perder o acesso: %d", r.Status)
 	}
 
@@ -804,7 +805,7 @@ func TestAuditTrailRecordsWhoDidWhatWithoutSecrets(t *testing.T) {
 	// operador reconhece um alerta: o autor real fica registrado
 	e.sample(srvID, time.Now().UTC(), 97, 4, 500, 1000, nil, nil)
 	e.exec(`UPDATE servers SET last_seen_at = now() WHERE id=$1`, srvID)
-	op.do("POST", "/api/v1/alert-rules", map[string]any{"name": "CPU", "metric_name": "cpu_usage_percent", "operator": ">", "threshold": 90, "severity": "critical"})
+	e.rule("CPU", "cpu_usage_percent", ">", 90, "critical", 0, "")
 	e.evaluator().Tick(context.Background())
 	alertID := e.queryID(`SELECT id::text FROM alerts WHERE status='firing'`)
 	ack := op.do("POST", "/api/v1/alerts/"+alertID+"/acknowledge", map[string]string{"note": "estou vendo"})
@@ -828,7 +829,7 @@ func TestAuditTrailRecordsWhoDidWhatWithoutSecrets(t *testing.T) {
 		m := it.(map[string]any)
 		byAction[m["action"].(string)] = m
 	}
-	for _, a := range []string{"auth.login", "server.create", "agent_credential.create", "user.create", "user.update", "alert_rule.create", "alert.acknowledge"} {
+	for _, a := range []string{"auth.login", "server.create", "agent_credential.create", "user.create", "user.update", "alert.acknowledge"} {
 		if byAction[a] == nil {
 			t.Errorf("ação %s ausente da auditoria", a)
 		}

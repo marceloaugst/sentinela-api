@@ -82,7 +82,7 @@ func (in *CreateInput) Validate() validation.Problems {
 		p.Add("chat_id", "deve ser um número (ex.: -1001234567890) ou @canal")
 	}
 	if in.MinSeverity == "" {
-		in.MinSeverity = "critical"
+		in.MinSeverity = "info"
 	}
 	if !validSeverity(in.MinSeverity) {
 		p.Add("min_severity", "deve ser info, warning ou critical")
@@ -139,7 +139,7 @@ func NewChannelRepository(pool *pgxpool.Pool, box *secrets.Box, allowedChats []s
 // ChatAllowed informa se o destino está autorizado. Sem nenhum destino configurado, nada é autorizado.
 func (r *ChannelRepository) ChatAllowed(chat string) bool { _, ok := r.allowed[chat]; return ok }
 
-const chCols = `id, name, channel_type, COALESCE(config->>'chat_id', ''), COALESCE(config->>'min_severity', 'critical'),
+const chCols = `id, name, channel_type, COALESCE(config->>'chat_id', ''), COALESCE(config->>'min_severity', 'info'),
 	is_enabled, secret_encrypted IS NOT NULL, created_at, updated_at`
 
 func scanChannel(row pgx.Row) (Channel, error) {
