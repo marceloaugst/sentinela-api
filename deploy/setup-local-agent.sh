@@ -28,7 +28,7 @@ trap 'rm -rf "$TMP"' EXIT
 umask 077
 
 echo "==> Compilando o agente"
-(cd "$ROOT" && go build -o "$TMP/sentinela-agent" ./cmd/agent)
+(cd "$ROOT" && go build -buildvcs=false -o "$TMP/sentinela-agent" ./cmd/agent)
 
 read -r -s -p "Senha do painel (${ADMIN_EMAIL}): " PW; echo
 

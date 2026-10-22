@@ -58,8 +58,12 @@ type Row struct {
 }
 
 // List devolve uma página (mais recentes primeiro) e o total que atende ao filtro.
+// Os resumos por minuto do nginx (access_summary) não são linhas de log: só aparecem se pedidos em Type.
 func (s *Store) List(ctx context.Context, f Filter, page, perPage int) ([]Row, int, error) {
 	where, p := f.where()
+	if f.Type == "" {
+		where += " AND type != 'access_summary'"
+	}
 	raw, err := s.query(ctx, "SELECT count() AS n FROM "+s.table()+" WHERE "+where+" FORMAT JSONEachRow", p)
 	if err != nil {
 		return nil, 0, err

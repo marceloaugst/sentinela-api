@@ -356,7 +356,7 @@ paths:
       description: |
         Logs coletados pelos agentes e guardados no ClickHouse. Período padrão: últimas 24 h; máximo de 31 dias por consulta.
         O conteúdo de `raw`, `ip` e `fields` vem de tráfego externo (User-Agent, URL, usuário do SSH...): **trate como texto não confiável**
-        e nunca como HTML. Query strings do nginx não são armazenadas. Retenção: `LOGS_RETENTION_DAYS` (90).
+        e nunca como HTML. Query strings do nginx não são armazenadas. Os resumos por minuto do nginx (`access_summary`) só aparecem quando pedidos em `type`. Retenção: `LOGS_RETENTION_DAYS` (90).
         Responde **503 `LOGS_UNAVAILABLE`** quando `CLICKHOUSE_URL` não está configurada ou o ClickHouse está fora do ar.
       operationId: listLogs
       x-required-role: viewer

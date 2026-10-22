@@ -60,11 +60,16 @@ func TestInsertListStats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if total != 5 || len(rows) != 5 {
-		t.Fatalf("total=%d rows=%d (deduplicação falhou?)", total, len(rows))
+	if total != 4 || len(rows) != 4 {
+		t.Fatalf("total=%d rows=%d (deduplicação falhou? o resumo não entra na lista)", total, len(rows))
 	}
-	if !rows[0].Time.After(rows[1].Time) || rows[0].Type != logs.TypeAccessSummary {
+	if !rows[0].Time.After(rows[1].Time) || rows[0].Type != logs.TypeAccess {
 		t.Errorf("ordem decrescente esperada: %+v", rows[0])
+	}
+	fs := f
+	fs.Type = logs.TypeAccessSummary
+	if sum, n, _ := s.List(ctx, fs, 1, 10); n != 1 || len(sum) != 1 || sum[0].Fields["requests"] != "120" {
+		t.Errorf("o resumo deve aparecer quando pedido por type: %d %+v", n, sum)
 	}
 	var ban Row
 	for _, r := range rows {
@@ -87,7 +92,7 @@ func TestInsertListStats(t *testing.T) {
 	if _, total, _ = s.List(ctx, f3, 1, 10); total != 1 {
 		t.Errorf("busca q: total=%d", total)
 	}
-	if rows, total, _ = s.List(ctx, f, 2, 2); total != 5 || len(rows) != 2 {
+	if rows, total, _ = s.List(ctx, f, 2, 2); total != 4 || len(rows) != 2 {
 		t.Errorf("paginação: total=%d len=%d", total, len(rows))
 	}
 
@@ -98,7 +103,7 @@ func TestInsertListStats(t *testing.T) {
 	if _, total, err = s.List(ctx, f4, 1, 10); err != nil || total != 0 {
 		t.Errorf("injeção: total=%d err=%v", total, err)
 	}
-	if _, total, _ = s.List(ctx, f, 1, 1); total != 5 {
+	if _, total, _ = s.List(ctx, f, 1, 1); total != 4 {
 		t.Error("a tabela foi afetada")
 	}
 
