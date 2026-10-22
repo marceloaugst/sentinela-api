@@ -52,3 +52,6 @@ Restart=always
 O agente recebe em `GET /agent/config` a lista de serviços `tcp`/`systemd` do **seu** servidor (apenas id, nome, tipo, alvo e tempos) e envia os resultados em lote a `POST /agent/services`, no intervalo de cada serviço. A lista é atualizada a cada 60 s (ou na hora, se a API recusar algum resultado).
 
 Segurança: a API diz *qual* serviço verificar; o agente decide *como*, com código próprio, e **revalida** cada alvo — `tcp` só conecta em loopback e `systemd` só aceita nomes `[A-Za-z0-9:_.@-]`, consultando o cgroup em vez de executar `systemctl`. Mesmo uma API comprometida não consegue fazer o agente conectar em outro host ou executar um comando.
+
+## Envio de logs (nginx, fail2ban, ufw)
+Opcional e desativado por padrão: `SENTINELA_LOGS=nginx,fail2ban,ufw`. O agente só **lê** os arquivos de log e confirma cada lote com a API antes de avançar a posição. Variáveis, formato e garantias em [logs.md](logs.md).

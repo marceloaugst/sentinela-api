@@ -28,6 +28,8 @@ type Metrics struct {
 	// Stream SSE: conexões abertas e eventos entregues/descartados por cliente lento.
 	SSEClients prometheus.Gauge
 	SSEEvents  *prometheus.CounterVec
+	// Logs recebidos dos agentes, por fonte e resultado (stored|duplicate|error).
+	LogEntries *prometheus.CounterVec
 }
 
 func NewMetrics() *Metrics {
@@ -82,8 +84,12 @@ func NewMetrics() *Metrics {
 			Namespace: "sentinela", Name: "sse_events_total",
 			Help: "Eventos SSE por resultado (delivered|overflow).",
 		}, []string{"result"}),
+		LogEntries: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "sentinela", Name: "log_entries_total",
+			Help: "Entradas de log recebidas dos agentes, por resultado (stored|duplicate|error).",
+		}, []string{"result"}),
 	}
-	reg.MustRegister(m.Requests, m.Latency, m.InFlight, m.InternalErrs, m.Samples, m.JobDuration, m.RetentionDeleted, m.AlertTransitions, m.Notifications, m.ServiceChecks, m.SSEClients, m.SSEEvents,
+	reg.MustRegister(m.Requests, m.Latency, m.InFlight, m.InternalErrs, m.Samples, m.JobDuration, m.RetentionDeleted, m.AlertTransitions, m.Notifications, m.ServiceChecks, m.SSEClients, m.SSEEvents, m.LogEntries,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	return m
 }

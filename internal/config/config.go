@@ -79,6 +79,13 @@ type Config struct {
 	BootstrapPassword  string
 	AuditRetentionDays int
 
+	// Logs (ClickHouse). URL vazia = recurso desativado.
+	ClickHouseURL      string
+	ClickHouseDB       string
+	ClickHouseUser     string
+	ClickHousePassword string
+	LogsRetentionDays  int
+
 	AutoMigrate bool
 	LogLevel    string
 }
@@ -189,6 +196,11 @@ func Load(getenv func(string) string) (Config, error) {
 	c.BootstrapName = str("ADMIN_BOOTSTRAP_NAME", "Administrador")
 	c.BootstrapPassword = getenv("ADMIN_BOOTSTRAP_PASSWORD")
 	c.AuditRetentionDays = integer("AUDIT_RETENTION_DAYS", 365)
+	c.ClickHouseURL = str("CLICKHOUSE_URL", "")
+	c.ClickHouseDB = str("CLICKHOUSE_DB", "sentinela")
+	c.ClickHouseUser = str("CLICKHOUSE_USER", "")
+	c.ClickHousePassword = getenv("CLICKHOUSE_PASSWORD")
+	c.LogsRetentionDays = integer("LOGS_RETENTION_DAYS", 90)
 	for _, id := range strings.Split(getenv("TELEGRAM_ALLOWED_CHAT_IDS"), ",") {
 		if id = strings.TrimSpace(id); id != "" {
 			c.TelegramAllowedChatIDs = append(c.TelegramAllowedChatIDs, id)
@@ -287,6 +299,14 @@ func (c Config) validate() error {
 	}
 	if c.AuditRetentionDays < 0 {
 		errs = append(errs, errors.New("AUDIT_RETENTION_DAYS não pode ser negativo (0 = manter para sempre)"))
+	}
+	if c.ClickHouseURL != "" {
+		if u, err := url.Parse(c.ClickHouseURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+			errs = append(errs, errors.New("CLICKHOUSE_URL inválida (use http://host:8123)"))
+		}
+		if c.LogsRetentionDays < 1 || c.LogsRetentionDays > 3650 {
+			errs = append(errs, errors.New("LOGS_RETENTION_DAYS deve estar entre 1 e 3650"))
+		}
 	}
 	if c.NotificationMaxAttempts < 1 || c.NotificationMaxAttempts > 50 {
 		errs = append(errs, errors.New("NOTIFICATION_MAX_ATTEMPTS deve estar entre 1 e 50"))

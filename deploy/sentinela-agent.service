@@ -16,6 +16,15 @@ Environment=SENTINELA_AGENT_TOKEN_FILE=%d/agent-token
 Restart=always
 RestartSec=5
 DynamicUser=yes
+# Logs (opcional): remova o comentário da linha abaixo para enviar nginx, fail2ban e ufw à API.
+#Environment=SENTINELA_LOGS=nginx,fail2ban,ufw
+# Caminhos diferentes do padrão: SENTINELA_LOG_NGINX_ACCESS_PATH, SENTINELA_LOG_NGINX_ERROR_PATH,
+# SENTINELA_LOG_FAIL2BAN_PATH, SENTINELA_LOG_UFW_PATH. Para gravar TODO pedido do nginx: SENTINELA_LOG_NGINX_ALL=true
+# O grupo "adm" dá LEITURA em /var/log/nginx, fail2ban.log e ufw.log (Debian/Ubuntu); o agente não escreve neles.
+SupplementaryGroups=adm
+# Posição de leitura dos logs (sobrevive a reinícios), em /var/lib/sentinela
+StateDirectory=sentinela
+StateDirectoryMode=0700
 # Endurecimento: o agente só lê /proc, /sys e statfs.
 NoNewPrivileges=yes
 ProtectSystem=strict

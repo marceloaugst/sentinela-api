@@ -17,6 +17,26 @@ services:
       timeout: 3s
       retries: 10
 
+  # Logs (nginx, fail2ban, ufw): colunar, comprime bem e expira sozinho (TTL = LOGS_RETENTION_DAYS).
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: sentinela
+      CLICKHOUSE_USER: sentinela
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?defina CLICKHOUSE_PASSWORD no .env}
+    volumes:
+      - chdata:/var/lib/clickhouse
+      - ./clickhouse/low-memory.xml:/etc/clickhouse-server/config.d/low-memory.xml:ro
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    # Sem "ports": só acessível pela rede interna do compose.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   api:
     build:
       context: ..
@@ -24,6 +44,8 @@ services:
     restart: unless-stopped
     depends_on:
       postgres:
+        condition: service_healthy
+      clickhouse:
         condition: service_healthy
     environment:
       APP_ENV: ${APP_ENV:-development}
@@ -64,6 +86,11 @@ services:
       API_RATE_LIMIT_BURST: ${API_RATE_LIMIT_BURST:-100}
       METRICS_TOKEN: ${METRICS_TOKEN:-}
       AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: sentinela
+      CLICKHOUSE_USER: sentinela
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      LOGS_RETENTION_DAYS: ${LOGS_RETENTION_DAYS:-90}
     ports:
       # Publicado apenas em loopback; exponha ao público via proxy reverso (Nginx) com HTTPS.
       - "127.0.0.1:${API_HOST_PORT:-8080}:8080"
@@ -75,3 +102,4 @@ services:
 
 volumes:
   pgdata:
+  chdata:

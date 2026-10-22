@@ -1,0 +1,24 @@
+<!-- Montado em /etc/clickhouse-server/config.d/: ajustes para rodar junto da API em um VPS pequeno. -->
+<clickhouse>
+    <!-- caches e pools menores (padrões assumem servidores dedicados) -->
+    <mark_cache_size>268435456</mark_cache_size>
+    <uncompressed_cache_size>0</uncompressed_cache_size>
+    <max_server_memory_usage_to_ram_ratio>0.5</max_server_memory_usage_to_ram_ratio>
+    <max_concurrent_queries>40</max_concurrent_queries>
+    <background_schedule_pool_size>8</background_schedule_pool_size>
+
+    <!-- tabelas de diagnóstico próprias do ClickHouse crescem sem parar: desligadas -->
+    <query_log remove="1"/>
+    <query_thread_log remove="1"/>
+    <query_views_log remove="1"/>
+    <part_log remove="1"/>
+    <trace_log remove="1"/>
+    <text_log remove="1"/>
+    <metric_log remove="1"/>
+    <asynchronous_metric_log remove="1"/>
+    <session_log remove="1"/>
+    <processors_profile_log remove="1"/>
+    <opentelemetry_span_log remove="1"/>
+    <crash_log remove="1"/>
+    <error_log remove="1"/>
+</clickhouse>

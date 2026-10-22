@@ -30,12 +30,13 @@ const (
 	TypeIncidentCreated   = "incident.created"
 	TypeIncidentResolved  = "incident.resolved"
 	TypeServiceStatus     = "service.status_changed"
-	TypeResync            = "resync" // sintético: o cliente deve recarregar o estado pela API
+	TypeSecurityBan       = "security.ip_banned" // fail2ban baniu um IP
+	TypeResync            = "resync"             // sintético: o cliente deve recarregar o estado pela API
 )
 
 // AllTypes é a lista de tipos que um cliente pode pedir em ?types=.
 var AllTypes = []string{TypeServerStatus, TypeMetricsUpdated, TypeAlertTriggered, TypeAlertAcknowledged,
-	TypeAlertResolved, TypeIncidentCreated, TypeIncidentResolved, TypeServiceStatus}
+	TypeAlertResolved, TypeIncidentCreated, TypeIncidentResolved, TypeServiceStatus, TypeSecurityBan}
 
 func ValidType(t string) bool {
 	for _, x := range AllTypes {

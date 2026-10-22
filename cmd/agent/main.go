@@ -19,6 +19,7 @@ import (
 
 	"sentinela/internal/agentclient"
 	"sentinela/internal/collector"
+	"sentinela/internal/logtail"
 	"sentinela/internal/metrics"
 	"sentinela/internal/services"
 )
@@ -127,6 +128,8 @@ func run(log *slog.Logger) error {
 		log.Warn("heartbeat inicial falhou; seguindo", "err", err)
 	}
 	svc := newServiceRunner(log, client)
+	logsDone := startLogShipper(ctx, log, cfg)
+	defer func() { stop(); <-logsDone }() // garante que a posição dos logs foi gravada antes de sair
 	if remote, err := svc.refresh(ctx); err == nil && cfg.interval == 0 && remote > 0 {
 		interval = clampInterval(time.Duration(remote) * time.Second)
 	}
@@ -150,6 +153,33 @@ func run(log *slog.Logger) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+// startLogShipper inicia o envio de logs (nginx, fail2ban, ufw) se SENTINELA_LOGS estiver definida.
+// O canal devolvido é fechado quando o envio termina.
+func startLogShipper(ctx context.Context, log *slog.Logger, cfg settings) <-chan struct{} {
+	done := make(chan struct{})
+	ls, err := logtail.LoadSettings(os.Getenv)
+	if err != nil {
+		log.Error("configuração de logs inválida; envio de logs desativado", "err", err)
+		close(done)
+		return done
+	}
+	if len(ls.Sources) == 0 {
+		close(done)
+		return done
+	}
+	if ls.StateFile == "" {
+		log.Warn("sem diretório de estado (SENTINELA_STATE_DIR/StateDirectory): a posição dos logs não sobrevive a reinícios")
+	}
+	// Cliente próprio: poucas tentativas por envio (o laço do Shipper já repete a cada rodada).
+	lc := agentclient.New(cfg.apiURL, cfg.token, "sentinela-agent/"+version)
+	lc.MaxAttempts = 2
+	lc.HTTP.Timeout = 20 * time.Second
+	sh := &logtail.Shipper{Sources: ls.Build(time.Local), Client: lc, Log: log}
+	log.Info("envio de logs ativo", "sources", ls.Sources, "nginx_all", ls.NginxAll)
+	go func() { defer close(done); sh.Run(ctx) }()
+	return done
 }
 
 // logRejection destaca credencial rejeitada. O agente segue tentando a cada intervalo

@@ -69,7 +69,7 @@ A API escuta só em `127.0.0.1:8080` e o PostgreSQL não publica porta. Coloque 
 curl -sk -X POST https://SEU_SERVIDOR/api/v1/auth/login -H 'Content-Type: application/json' \
   -d '{"email":"voce@exemplo.com","password":"SUA_SENHA"}'
 ```
-A resposta traz `csrf_token`; o cookie de sessão é definido automaticamente. Esqueceu a senha? `docker compose ... run --rm -T api reset-password --email voce@exemplo.com`.
+A resposta traz `csrf_token`; o cookie de sessão é definido automaticamente. Esqueceu a senha? `docker compose ... run --rm -T api reset-password --email voce@exemplo.com`. Para criar-ou-redefinir em um só passo (também reativa a conta e limpa o bloqueio por tentativas): `... run --rm -T api seed-user --email voce@exemplo.com --role admin`.
 
 ### Instalar o agente em um servidor monitorado
 1. Como `admin`, cadastre o servidor (`POST /api/v1/servers`) e emita a credencial (`POST /api/v1/servers/{id}/agent-credentials`). O token (`snt_...`) **aparece uma única vez**.
@@ -80,6 +80,9 @@ A resposta traz `csrf_token`; o cookie de sessão é definido automaticamente. E
    journalctl -u sentinela-agent -f
    ```
 Detalhes e o que é coletado: [docs/agent.md](docs/agent.md).
+
+### Logs (nginx, fail2ban, firewall)
+O agente pode enviar os logs do nginx, do fail2ban e do ufw; ficam no ClickHouse (já incluído no compose), com retenção configurável e consulta em `GET /api/v1/logs`. Ative com `SENTINELA_LOGS=nginx,fail2ban,ufw` no agente. Detalhes em [docs/logs.md](docs/logs.md).
 
 ## Configuração
 Tudo por variáveis de ambiente; a lista completa e comentada está em [`.env.example`](.env.example). As principais:
@@ -104,7 +107,7 @@ make up / make down   # sobe/derruba o compose local
 ```
 Estrutura: `cmd/` (executáveis) · `internal/` (domínios: auth, servers, metrics, alerts, incidents, events…) · `migrations/` (SQL versionado, embutido no binário) · `api/openapi.yaml` · `deploy/` (Dockerfiles, compose, Nginx, scripts) · `docs/`.
 
-Comandos da API: `sentinela-api migrate | migrate-down | create-admin | reset-password | version`.
+Comandos da API: `sentinela-api migrate | migrate-down | create-admin | reset-password | seed-user | version`.
 
 ## Segurança
 - Segredos só em `.env` (ignorado pelo Git). **Nunca** publique o `.env`, dumps de banco ou chaves.

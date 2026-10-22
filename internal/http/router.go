@@ -21,6 +21,7 @@ import (
 	"sentinela/internal/http/middleware"
 	"sentinela/internal/http/response"
 	"sentinela/internal/incidents"
+	"sentinela/internal/logstore"
 	"sentinela/internal/metrics"
 	"sentinela/internal/notifications"
 	"sentinela/internal/passwords"
@@ -70,7 +71,9 @@ type Deps struct {
 	// Hub habilita GET /api/v1/events (SSE). Pode ser nil em testes.
 	Hub *events.Hub
 	// Auth é opcional: se nil, é criado a partir da configuração.
-	Auth     *auth.Service
+	Auth *auth.Service
+	// Logs é o armazenamento de logs (ClickHouse). Pode ser nil: as rotas respondem 503.
+	Logs     *logstore.Store
 	Registry *Registry
 	Version  string
 }
@@ -175,6 +178,11 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 		return audit.List(r.Context(), d.Pool, p)
 	}}
 
+	lgh := &handlers.Logs{Pool: d.Pool, Log: d.Log, Entries: d.Metrics.LogEntries}
+	if d.Logs != nil { // evita interface não-nil com ponteiro nil
+		lgh.Store = d.Logs
+	}
+
 	// Respostas da API nunca são guardadas em cache e há um limite de taxa por IP.
 	apiLimiter := ratelimit.New(float64(cfg.APIRateLimit), cfg.APIRateBurst)
 	loginLimiter := ratelimit.New(5, 10) // cada tentativa de login custa CPU/memória (Argon2id)
@@ -258,6 +266,10 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 		route("DELETE", "/notification-channels/{id}", A, chh.Delete)
 		route("POST", "/notification-channels/{id}/test", A, chh.Test)
 
+		// logs (nginx, fail2ban, firewall)
+		route("GET", "/logs", V, lgh.List)
+		route("GET", "/logs/stats", V, lgh.Stats)
+
 		// dashboard
 		route("GET", "/dashboard/summary", V, dh.Summary)
 		route("GET", "/dashboard/metrics", V, dh.DashboardMetrics)
@@ -277,15 +289,17 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 		Live:    events.NewLivePublisher(d.Pool, d.Log, 5*time.Second),
 	}
 	r.Route("/agent", func(r chi.Router) {
-		r.Use(middleware.BodyLimit(handlers.MaxAgentBodyBytes), agentAuth.Middleware)
+		r.Use(agentAuth.Middleware)
 		for _, rt := range []struct {
-			m, p string
-			h    nethttp.HandlerFunc
+			m, p  string
+			limit int64
+			h     nethttp.HandlerFunc
 		}{
-			{"POST", "/heartbeat", agh.Heartbeat}, {"POST", "/metrics", agh.PostMetrics},
-			{"POST", "/services", agh.PostServices}, {"GET", "/config", agh.Config},
+			{"POST", "/heartbeat", handlers.MaxAgentBodyBytes, agh.Heartbeat}, {"POST", "/metrics", handlers.MaxAgentBodyBytes, agh.PostMetrics},
+			{"POST", "/services", handlers.MaxAgentBodyBytes, agh.PostServices}, {"GET", "/config", handlers.MaxAgentBodyBytes, agh.Config},
+			{"POST", "/logs", handlers.MaxLogBatchBytes, lgh.PostLogs},
 		} {
-			r.MethodFunc(rt.m, rt.p, rt.h)
+			r.With(middleware.BodyLimit(rt.limit)).MethodFunc(rt.m, rt.p, rt.h)
 			d.Registry.add(RouteInfo{Method: rt.m, Path: "/api/v1/agent" + rt.p, Kind: "agent"})
 		}
 	})

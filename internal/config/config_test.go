@@ -45,6 +45,8 @@ func TestLoadErrors(t *testing.T) {
 		"cors * em prod":   {"DATABASE_URL": "x", "APP_ENV": "production", "CORS_ALLOWED_ORIGINS": "*"},
 		"admin key curta":  {"DATABASE_URL": "x", "ADMIN_API_KEY": "curta"},
 		"intervalo agente": {"DATABASE_URL": "x", "AGENT_COLLECT_INTERVAL_SECONDS": "1"},
+		"clickhouse url":   {"DATABASE_URL": "x", "CLICKHOUSE_URL": "clickhouse:9000"},
+		"retenção logs":    {"DATABASE_URL": "x", "CLICKHOUSE_URL": "http://ch:8123", "LOGS_RETENTION_DAYS": "0"},
 		"rate zero":        {"DATABASE_URL": "x", "AGENT_RATE_LIMIT_PER_SECOND": "0"},
 		"pool inválido":    {"DATABASE_URL": "x", "DB_MAX_CONNS": "2", "DB_MIN_CONNS": "5"},
 	}
@@ -152,5 +154,19 @@ func TestLoadReportsAllErrors(t *testing.T) {
 	_, err := Load(env(map[string]string{"APP_ENV": "x"}))
 	if err == nil || !strings.Contains(err.Error(), "DATABASE_URL") || !strings.Contains(err.Error(), "APP_ENV") {
 		t.Errorf("deveria agregar erros: %v", err)
+	}
+}
+
+func TestLoadLogsConfig(t *testing.T) {
+	c, err := Load(env(map[string]string{"DATABASE_URL": "x"}))
+	if err != nil || c.ClickHouseURL != "" || c.LogsRetentionDays != 90 {
+		t.Fatalf("padrão: logs desativados e 90 dias: %+v %v", c, err)
+	}
+	c, err = Load(env(map[string]string{"DATABASE_URL": "x", "CLICKHOUSE_URL": "http://clickhouse:8123", "CLICKHOUSE_PASSWORD": " s3 ", "LOGS_RETENTION_DAYS": "30"}))
+	if err != nil || c.ClickHouseURL != "http://clickhouse:8123" || c.ClickHouseDB != "sentinela" || c.LogsRetentionDays != 30 {
+		t.Fatalf("%+v %v", c, err)
+	}
+	if c.ClickHousePassword != " s3 " { // senhas não são "aparadas"
+		t.Errorf("senha alterada: %q", c.ClickHousePassword)
 	}
 }

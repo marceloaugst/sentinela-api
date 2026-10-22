@@ -198,6 +198,7 @@ else
       echo "API_HOST_PORT=$LOCAL_PORT"
       echo "TRUST_PROXY=true"
       echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)"
+      echo "CLICKHOUSE_PASSWORD=$(openssl rand -hex 24)"
       echo "SECRETS_KEY=$(openssl rand -hex 32)"
       echo "METRICS_TOKEN=$(openssl rand -hex 24)"
       echo "ADMIN_API_KEY="
@@ -208,6 +209,8 @@ else
     ok ".env existente preservado"
   fi
   grep -q '^API_HOST_PORT=' "$APP_DIR/.env" || echo "API_HOST_PORT=$LOCAL_PORT" >> "$APP_DIR/.env"
+  # instalações anteriores aos logs: o ClickHouse (novo volume) ganha uma senha própria
+  grep -q '^CLICKHOUSE_PASSWORD=.' "$APP_DIR/.env" || echo "CLICKHOUSE_PASSWORD=$(openssl rand -hex 24)" >> "$APP_DIR/.env"
   PORT_IN_USE="$(ss -ltn "sport = :$LOCAL_PORT" 2>/dev/null | awk 'NR>1' | head -1)"
   RUNNING_API="$(compose ps --status running --services 2>/dev/null || true)"
   if [ -n "$PORT_IN_USE" ] && [[ "$RUNNING_API" != *api* ]]; then die "a porta $LOCAL_PORT já está em uso: $PORT_IN_USE"; fi

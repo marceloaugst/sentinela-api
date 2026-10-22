@@ -120,6 +120,8 @@ docker compose -f deploy/compose.yaml --env-file .env exec -T postgres \
   pg_restore -U sentinela -d sentinela --clean --if-exists --no-owner < /var/backups/sentinela/ARQUIVO.dump
 docker compose -f deploy/compose.yaml --env-file .env start api
 ```
+Os logs (ClickHouse, volume `chdata`) não fazem parte deste backup; veja [logs.md](logs.md#operação).
+
 **Teste a restauração periodicamente** num ambiente descartável: backup que nunca foi restaurado não é backup.
 
 ## 8. Atualização e rollback

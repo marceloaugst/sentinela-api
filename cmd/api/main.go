@@ -22,6 +22,7 @@ import (
 	"sentinela/internal/database"
 	"sentinela/internal/events"
 	apphttp "sentinela/internal/http"
+	"sentinela/internal/logstore"
 	"sentinela/internal/notifications"
 	"sentinela/internal/retention"
 	"sentinela/internal/scheduler"
@@ -168,10 +169,35 @@ func run(args []string) error {
 	monitor := &servers.ConnectivityMonitor{Pool: pool, Timeout: cfg.AgentHeartbeatTimeout}
 	spawn(func() { scheduler.Loop(jobCtx, "server_connectivity", 5*time.Second, metrics, log, monitor.Tick) })
 
+	// Logs (ClickHouse): opcional. Se estiver fora do ar na subida, a API sobe e tenta criar o esquema de
+	// 30 em 30 s; enquanto isso as rotas de logs respondem 503.
+	var logStore *logstore.Store
+	if cfg.ClickHouseURL != "" {
+		logStore, err = logstore.New(logstore.Config{URL: cfg.ClickHouseURL, Database: cfg.ClickHouseDB,
+			User: cfg.ClickHouseUser, Password: cfg.ClickHousePassword, RetentionDays: cfg.LogsRetentionDays})
+		if err != nil {
+			return err
+		}
+		spawn(func() {
+			scheduler.Loop(jobCtx, "logs_schema", 30*time.Second, metrics, log, func(c context.Context) error {
+				if logStore.Ready() {
+					return nil
+				}
+				if err := logStore.Init(c); err != nil {
+					return err
+				}
+				log.Info("armazenamento de logs pronto", "retention_days", cfg.LogsRetentionDays)
+				return nil
+			})
+		})
+	} else {
+		log.Info("logs desativados (CLICKHOUSE_URL vazia)")
+	}
+
 	srv := &nethttp.Server{
 		Addr: cfg.HTTPAddr,
 		Handler: apphttp.NewRouter(apphttp.Deps{
-			Config: cfg, Log: log, Metrics: metrics, DB: pool, Pool: pool, Hub: hub, Auth: authSvc, Version: version,
+			Config: cfg, Log: log, Metrics: metrics, DB: pool, Pool: pool, Hub: hub, Auth: authSvc, Logs: logStore, Version: version,
 		}),
 		ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout,
 		ReadTimeout:       cfg.HTTPReadTimeout,
@@ -226,8 +252,10 @@ func runCommand(ctx context.Context, log *slog.Logger, m *database.Migrator, aut
 		return createAdmin(ctx, log, authSvc, args[1:])
 	case "reset-password":
 		return resetPassword(ctx, log, authSvc, args[1:])
+	case "seed-user":
+		return seedUser(ctx, log, authSvc, args[1:])
 	default:
-		return fmt.Errorf("comando desconhecido %q (migrate|migrate-down|create-admin|reset-password|version)", args[0])
+		return fmt.Errorf("comando desconhecido %q (migrate|migrate-down|create-admin|reset-password|seed-user|version)", args[0])
 	}
 	return nil
 }
@@ -298,5 +326,59 @@ func resetPassword(ctx context.Context, log *slog.Logger, svc *auth.Service, arg
 		return err
 	}
 	log.Info("senha redefinida; sessões revogadas", "email", norm, "revoked_sessions", revoked)
+	return nil
+}
+
+// seedUser é idempotente: cria o usuário se o e-mail não existir; se existir, redefine a senha, o papel,
+// reativa a conta, revoga as sessões e limpa o bloqueio por tentativas de login.
+func seedUser(ctx context.Context, log *slog.Logger, svc *auth.Service, args []string) error {
+	fs := flag.NewFlagSet("seed-user", flag.ContinueOnError)
+	email := fs.String("email", "", "e-mail do usuário")
+	name := fs.String("name", "Administrador", "nome (usado só ao criar)")
+	role := fs.String("role", users.RoleAdmin, "papel: viewer, operator ou admin")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	norm, ok := users.NormalizeEmail(*email)
+	if !ok {
+		return errors.New("e-mail inválido")
+	}
+	pw, err := readPassword()
+	if err != nil {
+		return err
+	}
+	ac := audit.Context{Actor: "cli"}
+
+	cred, err := svc.Users.GetCredentialsByEmail(ctx, norm)
+	switch {
+	case errors.Is(err, users.ErrNotFound):
+		in := users.CreateInput{Name: *name, Email: norm, Role: *role, Password: pw}
+		if p := in.Validate(); len(p) > 0 {
+			return fmt.Errorf("dados inválidos: %s %s", p[0].Field, p[0].Message)
+		}
+		u, err := svc.CreateUser(ctx, ac, in)
+		if err != nil {
+			return err
+		}
+		log.Info("usuário criado", "id", u.ID, "email", u.Email, "role", u.Role)
+	case err != nil:
+		return err
+	default:
+		active := true
+		in := users.UpdateInput{Password: &pw, Role: role, IsActive: &active}
+		if p := in.Validate(cred.User); len(p) > 0 {
+			return fmt.Errorf("dados inválidos: %s %s", p[0].Field, p[0].Message)
+		}
+		_, revoked, err := svc.UpdateUser(ctx, ac, cred.ID, in)
+		if err != nil {
+			return err
+		}
+		log.Info("usuário atualizado: senha redefinida e conta reativada", "email", norm, "role", *role, "revoked_sessions", revoked)
+	}
+	cleared, err := svc.ClearLoginAttempts(ctx, norm)
+	if err != nil {
+		return err
+	}
+	log.Info("bloqueio de login limpo", "email", norm, "attempts_removed", cleared)
 	return nil
 }

@@ -24,6 +24,7 @@ data: {"id":7,"type":"alert.triggered","time":"2026-03-01T12:00:00Z","data":{"al
 | `service.status_changed` | serviço mudou de estado (unknown/up/down/degraded) | sim | verificação central ou relatório do agente |
 | `alert.triggered` / `alert.acknowledged` / `alert.resolved` | transições do alerta | sim | avaliador / API |
 | `incident.created` / `incident.resolved` | abertura e fechamento | sim | avaliador / API |
+| `security.ip_banned` | o fail2ban baniu um IP (`ip`, `jail`, `banned_at`; só bans recentes) | sim | ingestão de logs do agente ([logs.md](logs.md)) |
 | `metrics.updated` | nova amostra de um servidor (máx. 1 a cada 5 s por servidor) | **não** | ingestão do agente |
 | `resync` | o cliente deve recarregar o estado pela API (`reason`: `gap`, `ahead`, `too_many`, `overflow`, `error`) | — | sintético |
 

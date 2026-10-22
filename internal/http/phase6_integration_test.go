@@ -347,14 +347,15 @@ func TestAuthorizationMatrixCoversEveryRoute(t *testing.T) {
 				continue
 			}
 			r := byRole[role].do(rt.Method, path, body)
-			if r.Status == 401 || r.Status == 403 || r.Status >= 500 {
+			// 503 LOGS_UNAVAILABLE é a resposta documentada do handler quando o ClickHouse não está configurado
+			if r.Status == 401 || r.Status == 403 || (r.Status >= 500 && r.errCode() != "LOGS_UNAVAILABLE") {
 				t.Errorf("%s com papel %s (suficiente): %d %s", label, role, r.Status, r.Raw)
 			}
 			checked["permitido"]++
 		}
 	}
 	t.Logf("matriz: %d rotas; verificações %v", len(routes), checked)
-	if checked["negado"] < 40 || checked["permitido"] < 100 || checked["agent"] != 4 {
+	if checked["negado"] < 40 || checked["permitido"] < 100 || checked["agent"] != 5 {
 		t.Errorf("cobertura da matriz: %v", checked)
 	}
 
