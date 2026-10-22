@@ -408,6 +408,13 @@ type BootstrapError struct{ Problems validation.Problems }
 
 func (e *BootstrapError) Error() string { return "dados do administrador inicial inválidos" }
 
+// ClearLoginAttempts apaga as tentativas de login do e-mail, desfazendo um bloqueio por tentativas
+// (usado pelo comando seed-user). Devolve quantas linhas foram removidas.
+func (s *Service) ClearLoginAttempts(ctx context.Context, email string) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM login_attempts WHERE email = $1`, email)
+	return tag.RowsAffected(), err
+}
+
 // Cleanup remove sessões vencidas/revogadas há tempo e tentativas de login antigas. Devolve (sessões, tentativas).
 func (s *Service) Cleanup(ctx context.Context) (int64, int64, error) {
 	now := s.now()

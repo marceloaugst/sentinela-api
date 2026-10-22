@@ -12,28 +12,17 @@ import (
 	"sentinela/internal/validation"
 )
 
+// Services expõe os serviços descobertos automaticamente (somente leitura: não há cadastro).
 type Services struct {
-	Repo       *services.Repository
-	Servers    *servers.Repository
-	Validator  services.Validator
-	Runner     *services.Runner
-	Log        *slog.Logger
-	TrustProxy bool
+	Repo    *services.Repository
+	Servers *servers.Repository
+	Log     *slog.Logger
 }
 
 func (h Services) fail(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, services.ErrNotFound), errors.Is(err, servers.ErrNotFound):
 		response.NotFound(w)
-	case errors.Is(err, services.ErrServerNotFound):
-		var p validation.Problems
-		p.Add("server_id", "servidor não encontrado")
-		response.Validation(w, p)
-	case errors.Is(err, services.ErrConflict):
-		response.Error(w, http.StatusConflict, "CONFLICT", "Já existe um serviço com esse nome neste servidor.")
-	case errors.Is(err, services.ErrNotCentral):
-		response.Error(w, http.StatusConflict, "CHECK_NOT_CENTRAL",
-			"Serviços tcp e systemd são verificados pelo agente do servidor, em seu próprio intervalo.")
 	default:
 		h.Log.Error("erro em handler de serviços", "err", err)
 		response.Internal(w)
@@ -63,10 +52,10 @@ func (h Services) listParams(r *http.Request, p *validation.Problems) services.L
 	}
 	if v := q.Get("service_type"); v != "" {
 		switch v {
-		case services.TypeHTTP, services.TypeTCP, services.TypeSystemd:
+		case services.TypeDiscovered:
 			lp.Type = v
 		default:
-			p.Add("service_type", "deve ser http, tcp ou systemd")
+			p.Add("service_type", "deve ser discovered")
 		}
 	}
 	return lp
@@ -112,25 +101,6 @@ func (h Services) ListByServer(w http.ResponseWriter, r *http.Request) {
 	response.JSON(w, http.StatusOK, list, newPageMeta(lp.Page, lp.PerPage, total))
 }
 
-func (h Services) Create(w http.ResponseWriter, r *http.Request) {
-	var in services.CreateInput
-	if !response.Decode(w, r, &in) {
-		return
-	}
-	cfg, p := h.Validator.Create(&in)
-	if len(p) > 0 {
-		response.Validation(w, p)
-		return
-	}
-	s, err := h.Repo.Create(r.Context(), auditCtx(r, h.TrustProxy), in, cfg)
-	if err != nil {
-		h.fail(w, err)
-		return
-	}
-	w.Header().Set("Location", "/api/v1/services/"+s.ID)
-	response.JSON(w, http.StatusCreated, s, nil)
-}
-
 func (h Services) Get(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathUUID(w, r, "id")
 	if !ok {
@@ -142,78 +112,4 @@ func (h Services) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response.JSON(w, http.StatusOK, s, nil)
-}
-
-func (h Services) Update(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathUUID(w, r, "id")
-	if !ok {
-		return
-	}
-	var in services.UpdateInput
-	if !response.Decode(w, r, &in) {
-		return
-	}
-	cur, err := h.Repo.Get(r.Context(), id)
-	if err != nil {
-		h.fail(w, err)
-		return
-	}
-	cfg, p := h.Validator.Update(cur, &in)
-	if len(p) > 0 {
-		response.Validation(w, p)
-		return
-	}
-	s, err := h.Repo.Update(r.Context(), auditCtx(r, h.TrustProxy), id, in, cfg)
-	if err != nil {
-		h.fail(w, err)
-		return
-	}
-	response.JSON(w, http.StatusOK, s, nil)
-}
-
-func (h Services) Delete(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathUUID(w, r, "id")
-	if !ok {
-		return
-	}
-	if err := h.Repo.Delete(r.Context(), auditCtx(r, h.TrustProxy), id); err != nil {
-		h.fail(w, err)
-		return
-	}
-	response.NoContent(w)
-}
-
-type checkResult struct {
-	Status     string  `json:"status"`
-	LatencyMS  *int    `json:"latency_ms"`
-	StatusCode *int    `json:"status_code"`
-	Error      *string `json:"error"`
-}
-
-// POST /services/{id}/check: executa agora a verificação de um serviço http.
-func (h Services) Check(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathUUID(w, r, "id")
-	if !ok {
-		return
-	}
-	s, err := h.Repo.Get(r.Context(), id)
-	if err != nil {
-		h.fail(w, err)
-		return
-	}
-	res, err := h.Runner.CheckOne(r.Context(), s)
-	if err != nil {
-		h.fail(w, err)
-		return
-	}
-	updated, err := h.Repo.Get(r.Context(), id)
-	if err != nil {
-		h.fail(w, err)
-		return
-	}
-	cr := checkResult{Status: res.Status, LatencyMS: res.LatencyMS, StatusCode: res.StatusCode}
-	if res.Error != "" {
-		cr.Error = &res.Error
-	}
-	response.JSON(w, http.StatusOK, map[string]any{"service": updated, "result": cr}, nil)
 }

@@ -43,8 +43,7 @@
 ## Decisões da Fase 4
 | Tema | Decisão |
 |---|---|
-| Quem verifica o quê | `http` pela API (com anti-SSRF); `tcp`/`systemd` pelo agente. Todo serviço tem `server_id` obrigatório (alertas e incidentes referenciam um servidor). |
-| Fila de verificações | `next_check_at` + `FOR UPDATE SKIP LOCKED`: a reserva avança o próximo horário na mesma transação (várias instâncias não verificam duas vezes; se uma cair, o serviço é retomado no ciclo seguinte). |
+| Serviços | Sem cadastro: o agente descobre os serviços do sistema e envia fatos (`POST /agent/discovery`); a API espelha em `monitored_services` (tipo `discovered`) para alertas e incidentes. Todo serviço tem `server_id` obrigatório. |
 | Avaliador de alertas | Função pura `Decide` (tabela de transições testada) + efeitos transacionais. Um *snapshot* compartilhado (servidores ativos + serviços) alimenta todas as regras: poucas consultas por ciclo. Lock consultivo de sessão garante uma instância avaliando. |
 | Estado persistido | `alerts.pending_since` / `recovering_since`; `pending` é invisível na API e fora dos agregados do dashboard. |
 | Incidentes | Aberto na promoção a `firing`, fechado ao resolver o alerta; eventos em `incident_events` (opened, alert_triggered, acknowledged, alert_resolved, resolved). |

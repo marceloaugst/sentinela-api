@@ -16,6 +16,7 @@ import (
 	"sentinela/internal/auth"
 	"sentinela/internal/config"
 	"sentinela/internal/dashboard"
+	"sentinela/internal/discovery"
 	"sentinela/internal/events"
 	"sentinela/internal/http/handlers"
 	"sentinela/internal/http/middleware"
@@ -29,7 +30,6 @@ import (
 	"sentinela/internal/secrets"
 	"sentinela/internal/servers"
 	"sentinela/internal/services"
-	"sentinela/internal/ssrf"
 	"sentinela/internal/telemetry"
 	"sentinela/internal/users"
 )
@@ -153,10 +153,9 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 	metRepo := metrics.NewRepository(d.Pool)
 	dashRepo := dashboard.NewRepository(d.Pool, cfg.AgentHeartbeatTimeout)
 	svcRepo := services.NewRepository(d.Pool)
+	discRepo := discovery.NewRepository(d.Pool)
 	alertRepo := alerts.NewRepository(d.Pool)
 	incRepo := incidents.NewRepository(d.Pool)
-	policy := ssrf.Policy{Allowed: cfg.ServiceCheckAllowed}
-	runner := &services.Runner{Repo: svcRepo, Checker: services.NewChecker(policy), Log: d.Log}
 	var box *secrets.Box
 	if cfg.SecretsKey != nil {
 		var err error
@@ -167,7 +166,8 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 	chRepo := notifications.NewChannelRepository(d.Pool, box, cfg.TelegramAllowedChatIDs)
 
 	sh := handlers.Servers{Repo: srvRepo, Creds: credRepo, Log: d.Log, TrustProxy: cfg.TrustProxy}
-	svh := handlers.Services{Repo: svcRepo, Servers: srvRepo, Validator: services.Validator{Policy: policy}, Runner: runner, Log: d.Log, TrustProxy: cfg.TrustProxy}
+	svh := handlers.Services{Repo: svcRepo, Servers: srvRepo, Log: d.Log}
+	dsh := handlers.Discovery{Repo: discRepo, Servers: srvRepo, Log: d.Log}
 	alh := handlers.Alerts{Repo: alertRepo, Log: d.Log, TrustProxy: cfg.TrustProxy}
 	inh := handlers.Incidents{Repo: incRepo, Servers: srvRepo, Log: d.Log}
 	chh := handlers.Channels{Repo: chRepo, Log: d.Log, TrustProxy: cfg.TrustProxy}
@@ -229,18 +229,15 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 		route("GET", "/servers/{id}/summary", V, dh.ServerSummary)
 		route("GET", "/servers/{id}/metrics", V, dh.ServerMetrics)
 		route("GET", "/servers/{id}/services", V, svh.ListByServer)
+		route("GET", "/servers/{id}/discovery", V, dsh.ListByServer)
 		route("GET", "/servers/{id}/incidents", V, inh.ListByServer)
 		route("GET", "/servers/{id}/agent-credentials", A, sh.ListCredentials)
 		route("POST", "/servers/{id}/agent-credentials", A, sh.IssueCredential)
 		route("DELETE", "/servers/{id}/agent-credentials/{credentialId}", A, sh.RevokeCredential)
 
-		// serviços monitorados
+		// serviços (descobertos automaticamente; somente leitura)
 		route("GET", "/services", V, svh.List)
-		route("POST", "/services", O, svh.Create)
 		route("GET", "/services/{id}", V, svh.Get)
-		route("PATCH", "/services/{id}", O, svh.Update)
-		route("DELETE", "/services/{id}", O, svh.Delete)
-		route("POST", "/services/{id}/check", O, svh.Check)
 
 		// regras e alertas
 		route("GET", "/alert-rules", V, alh.ListRules)
@@ -283,7 +280,7 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 		agentAuth.ByCred = ratelimit.New(float64(cfg.AgentRatePerSecond), cfg.AgentRateBurst)
 	}
 	agh := handlers.Agent{
-		Metrics: metRepo, Services: svcRepo, Log: d.Log,
+		Metrics: metRepo, Services: svcRepo, Discovery: discRepo, Log: d.Log,
 		CollectInterval: cfg.AgentCollectInterval, HeartbeatTimeout: cfg.AgentHeartbeatTimeout,
 		Samples: d.Metrics.Samples,
 		Live:    events.NewLivePublisher(d.Pool, d.Log, 5*time.Second),
@@ -296,7 +293,8 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 			h     nethttp.HandlerFunc
 		}{
 			{"POST", "/heartbeat", handlers.MaxAgentBodyBytes, agh.Heartbeat}, {"POST", "/metrics", handlers.MaxAgentBodyBytes, agh.PostMetrics},
-			{"POST", "/services", handlers.MaxAgentBodyBytes, agh.PostServices}, {"GET", "/config", handlers.MaxAgentBodyBytes, agh.Config},
+			{"GET", "/config", handlers.MaxAgentBodyBytes, agh.Config},
+			{"POST", "/discovery", handlers.MaxAgentBodyBytes, agh.PostDiscovery},
 			{"POST", "/logs", handlers.MaxLogBatchBytes, lgh.PostLogs},
 		} {
 			r.With(middleware.BodyLimit(rt.limit)).MethodFunc(rt.m, rt.p, rt.h)

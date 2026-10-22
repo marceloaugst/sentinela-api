@@ -454,6 +454,7 @@ func TestDisablingAndDeletingRulesResolveTheirAlerts(t *testing.T) {
 
 func TestServiceDownRule(t *testing.T) {
 	f := newFx(t)
+	f.pool.Exec(ctx, `DELETE FROM alert_rules`) // a migração cria uma regra service_down padrão
 	srv := f.server("web")
 	f.beat(srv, 10)
 	var httpSvc, tcpSvc string

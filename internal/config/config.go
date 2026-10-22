@@ -4,7 +4,6 @@ package config
 import (
 	"errors"
 	"fmt"
-	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -12,7 +11,6 @@ import (
 	"time"
 
 	"sentinela/internal/secrets"
-	"sentinela/internal/ssrf"
 )
 
 type Config struct {
@@ -51,7 +49,6 @@ type Config struct {
 	SecretsKey              []byte // chave AES-256 para segredos em repouso (nil = ausente)
 	TelegramAllowedChatIDs  []string
 	TelegramAPIBase         string
-	ServiceCheckAllowed     []netip.Prefix // CIDRs internos explicitamente autorizados para verificações http
 	AlertEvaluationInterval time.Duration
 	NotificationMaxAttempts int
 
@@ -210,12 +207,6 @@ func Load(getenv func(string) string) (Config, error) {
 	if c.TelegramChatID != "" {
 		c.TelegramAllowedChatIDs = append(c.TelegramAllowedChatIDs, c.TelegramChatID)
 	}
-	if cidrs, err := ssrf.ParseAllowed(getenv("SERVICE_CHECK_ALLOWED_CIDRS")); err != nil {
-		errs = append(errs, fmt.Errorf("SERVICE_CHECK_ALLOWED_CIDRS: %w", err))
-	} else {
-		c.ServiceCheckAllowed = cidrs
-	}
-
 	for _, o := range strings.Split(getenv("CORS_ALLOWED_ORIGINS"), ",") {
 		if o = strings.TrimSpace(o); o != "" {
 			c.CORSAllowedOrigins = append(c.CORSAllowedOrigins, o)

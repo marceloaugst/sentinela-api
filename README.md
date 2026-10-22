@@ -17,7 +17,7 @@ Monitoramento de servidores Linux: uma **API REST em Go** (PostgreSQL) que receb
 ```
 
 1. **Agente** (`cmd/agent`): binário único, sem dependências. Só lê `/proc`, não abre portas e **nunca executa comandos** vindos da API. Envia heartbeat e métricas por HTTPS com um token individual (`snt_...`).
-2. **API** (`cmd/api`): guarda métricas, calcula séries agregadas, avalia regras de alerta (com máquina de estados persistida), abre e fecha incidentes, faz verificações de serviço HTTP (com proteção anti-SSRF) e envia notificações.
+2. **API** (`cmd/api`): guarda métricas, calcula séries agregadas, avalia regras de alerta (com máquina de estados persistida), abre e fecha incidentes, espelha os serviços descobertos pelos agentes (sem cadastro) em alertas e incidentes e envia notificações.
 3. **Tempo real**: `GET /api/v1/events` (SSE) com replay por `Last-Event-ID`, funcionando com várias instâncias da API sem broker externo.
 4. **Acesso**: login por sessão (cookie `HttpOnly`), papéis `viewer < operator < admin`, proteção CSRF, bloqueio de força bruta, Argon2id e auditoria de ações.
 

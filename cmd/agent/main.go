@@ -13,15 +13,14 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"sentinela/internal/agentclient"
 	"sentinela/internal/collector"
+	"sentinela/internal/discovery"
 	"sentinela/internal/logtail"
 	"sentinela/internal/metrics"
-	"sentinela/internal/services"
 )
 
 var version = "dev"
@@ -127,10 +126,10 @@ func run(log *slog.Logger) error {
 		logRejection(log, err)
 		log.Warn("heartbeat inicial falhou; seguindo", "err", err)
 	}
-	svc := newServiceRunner(log, client)
+	disc := newDiscoveryRunner(log, client)
 	logsDone := startLogShipper(ctx, log, cfg)
 	defer func() { stop(); <-logsDone }() // garante que a posição dos logs foi gravada antes de sair
-	if remote, err := svc.refresh(ctx); err == nil && cfg.interval == 0 && remote > 0 {
+	if remote := fetchCollectInterval(ctx, log, client); cfg.interval == 0 && remote > 0 {
 		interval = clampInterval(time.Duration(remote) * time.Second)
 	}
 	log.Info("agente iniciado", "version", version, "api", cfg.apiURL, "interval", interval.String())
@@ -145,7 +144,7 @@ func run(log *slog.Logger) error {
 	defer ticker.Stop()
 	for {
 		collectAndSend(ctx, log, col, client, interval)
-		svc.runDue(ctx, interval)
+		disc.runDue(ctx)
 		select {
 		case <-ctx.Done():
 			log.Info("agente encerrando")
@@ -216,95 +215,61 @@ func collectAndSend(ctx context.Context, log *slog.Logger, col *collector.Collec
 	log.Debug("métricas enviadas", "stored", res.Stored)
 }
 
-// serviceRunner mantém a lista de serviços locais (vinda de /agent/config) e executa cada um no
-// seu intervalo. Os resultados são enviados em lote a /agent/services.
-type serviceRunner struct {
-	log       *slog.Logger
-	client    *agentclient.Client
-	checker   *collector.ServiceChecker
-	list      []services.AgentService
-	lastRun   map[string]time.Time
-	refreshed time.Time
-}
-
-const configRefresh = time.Minute
-
-func newServiceRunner(log *slog.Logger, c *agentclient.Client) *serviceRunner {
-	return &serviceRunner{log: log, client: c, checker: collector.NewServiceChecker(), lastRun: map[string]time.Time{}}
-}
-
-// refresh busca a configuração; devolve o intervalo de coleta sugerido pela API.
-func (r *serviceRunner) refresh(ctx context.Context) (int, error) {
+// fetchCollectInterval busca em /agent/config o intervalo de coleta sugerido pela API (0 se indisponível).
+func fetchCollectInterval(ctx context.Context, log *slog.Logger, client *agentclient.Client) int {
 	var remote struct {
-		CollectIntervalSeconds int                     `json:"collect_interval_seconds"`
-		Services               []services.AgentService `json:"services"`
+		CollectIntervalSeconds int `json:"collect_interval_seconds"`
 	}
-	if err := r.client.Do(ctx, "GET", "/api/v1/agent/config", nil, &remote); err != nil {
-		logRejection(r.log, err)
-		return 0, err
+	if err := client.Do(ctx, "GET", "/api/v1/agent/config", nil, &remote); err != nil {
+		logRejection(log, err)
+		return 0
 	}
-	r.list, r.refreshed = remote.Services, time.Now()
-	return remote.CollectIntervalSeconds, nil
+	return remote.CollectIntervalSeconds
 }
 
-func (r *serviceRunner) runDue(ctx context.Context, interval time.Duration) {
-	if time.Since(r.refreshed) >= configRefresh {
-		if _, err := r.refresh(ctx); err != nil {
-			r.log.Warn("não foi possível atualizar a configuração do agente", "err", err)
-		}
-	}
+// discoveryRunner descobre sozinho os serviços do sistema (ssh, cron, nginx, redis, postgresql...)
+// e envia o retrato a /agent/discovery quando algo muda — ou, no mínimo, a cada discoveryResend,
+// para a API saber que a informação continua atual. Nada precisa ser cadastrado.
+type discoveryRunner struct {
+	log        *slog.Logger
+	client     *agentclient.Client
+	discoverer *collector.Discoverer
+	lastCheck  time.Time
+	lastSent   time.Time
+	lastKey    string
+}
+
+const (
+	discoveryEvery  = time.Minute
+	discoveryResend = 5 * time.Minute
+)
+
+func newDiscoveryRunner(log *slog.Logger, c *agentclient.Client) *discoveryRunner {
+	return &discoveryRunner{log: log, client: c, discoverer: collector.NewDiscoverer()}
+}
+
+func (r *discoveryRunner) runDue(ctx context.Context) {
 	now := time.Now()
-	var due []services.AgentService
-	for _, s := range r.list {
-		iv := time.Duration(s.IntervalSeconds) * time.Second
-		if last, ok := r.lastRun[s.ID]; !ok || now.Sub(last) >= iv-time.Second {
-			due = append(due, s)
-		}
-	}
-	if len(due) == 0 {
+	if now.Sub(r.lastCheck) < discoveryEvery {
 		return
 	}
-	// verificações em paralelo (limitado) para que um serviço lento não atrase os demais
-	sctx, cancel := context.WithTimeout(ctx, interval)
+	r.lastCheck = now
+	found := r.discoverer.Discover()
+	var sb strings.Builder
+	for _, f := range found {
+		sb.WriteString(f.Key + "|" + f.Status + "|" + f.Source + "|" + f.Unit + ";")
+	}
+	key := sb.String()
+	if key == r.lastKey && now.Sub(r.lastSent) < discoveryResend {
+		return
+	}
+	sctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	var (
-		mu      sync.Mutex
-		results []services.AgentResult
-		wg      sync.WaitGroup
-		sem     = make(chan struct{}, 4)
-	)
-	checkedAt := time.Now().UTC()
-	for _, s := range due {
-		r.lastRun[s.ID] = now
-		sem <- struct{}{}
-		wg.Add(1)
-		go func(s services.AgentService) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			if res, ok := r.checker.Check(sctx, s); ok {
-				mu.Lock()
-				results = append(results, res)
-				mu.Unlock()
-			} else {
-				r.log.Warn("verificação não suportada neste host", "service", s.Name, "type", s.Type)
-			}
-		}(s)
-	}
-	wg.Wait()
-	if len(results) == 0 {
-		return
-	}
-	var out struct {
-		Accepted int                 `json:"accepted"`
-		Rejected []services.Rejected `json:"rejected"`
-	}
-	rep := services.AgentReport{CheckedAt: checkedAt, Results: results}
-	if err := r.client.Do(sctx, "POST", "/api/v1/agent/services", rep, &out); err != nil {
+	rep := discovery.Report{CheckedAt: now.UTC(), Services: found}
+	if err := r.client.Do(sctx, "POST", "/api/v1/agent/discovery", rep, nil); err != nil {
 		logRejection(r.log, err)
-		r.log.Warn("envio dos resultados de serviços falhou", "err", err)
+		r.log.Warn("envio da descoberta de serviços falhou", "err", err)
 		return
 	}
-	if len(out.Rejected) > 0 {
-		r.refreshed = time.Time{} // lista desatualizada (serviço removido?): atualiza no próximo ciclo
-	}
+	r.lastKey, r.lastSent = key, now
 }

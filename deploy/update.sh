@@ -89,6 +89,8 @@ step "3/6 Copiando o código novo para $APP_DIR (o .env é preservado)"
 if [ "$DRY_RUN" = 1 ]; then
   echo "  [dry-run] tar do repositório (sem .git/.env/bin) -> $APP_DIR; garante CLICKHOUSE_PASSWORD no .env"
 else
+  # o tar só sobrescreve: arquivos removidos do repositório (ex.: pacotes apagados) ficariam no destino e quebrariam o build
+  for d in cmd internal migrations api; do rm -rf "${APP_DIR:?}/$d"; done
   tar -C "$REPO" --exclude=.git --exclude=.env --exclude=bin -cf - . | tar -C "$APP_DIR" -xf -
   ok "código copiado"
   if ! grep -q '^CLICKHOUSE_PASSWORD=.' "$APP_DIR/.env"; then

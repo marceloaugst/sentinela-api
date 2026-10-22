@@ -90,9 +90,9 @@ Tipos: `server.status_changed`, `metrics.updated` (opt-in, no máximo 1 a cada 5
 | Login / sessão | `POST /auth/login`, `GET /auth/me`, `POST /auth/logout`, `POST /auth/logout-all`, `POST /auth/change-password` |
 | Dashboard | `GET /dashboard/summary`, `/dashboard/metrics`, `/dashboard/recent-alerts`, `/dashboard/recent-incidents` + SSE |
 | Lista de servidores | `GET /servers` (filtros `q`, `status`, `connection`, `sort`, `order`) |
-| Detalhe do servidor | `GET /servers/{id}`, `/servers/{id}/summary`, `/servers/{id}/metrics`, `/servers/{id}/disks`, `/servers/{id}/services`, `/servers/{id}/incidents` |
+| Detalhe do servidor | `GET /servers/{id}`, `/servers/{id}/summary`, `/servers/{id}/metrics`, `/servers/{id}/disks`, `/servers/{id}/services`, `/servers/{id}/discovery`, `/servers/{id}/incidents` |
 | Cadastro / credencial do agente | `POST /servers`, `PATCH /servers/{id}`, `POST /servers/{id}/agent-credentials` (o token aparece **uma única vez**) |
-| Serviços monitorados | `GET/POST /services`, `PATCH/DELETE /services/{id}`, `POST /services/{id}/check` |
+| Serviços (descobertos automaticamente, somente leitura) | `GET /services`, `GET /services/{id}` |
 | Alertas e regras | `GET /alerts`, `POST /alerts/{id}/acknowledge`, `POST /alerts/{id}/resolve`, `GET/POST /alert-rules`, `PATCH/DELETE /alert-rules/{id}` |
 | Incidentes | `GET /incidents`, `GET /incidents/{id}`, `GET /incidents/{id}/events` |
 | Notificações (Telegram) | `GET/POST /notification-channels`, `PATCH/DELETE /notification-channels/{id}`, `POST /notification-channels/{id}/test` |
@@ -779,7 +779,39 @@ Memória do balde = Σ usado / Σ total das amostras do balde.
 - `422` — Dados inválidos (VALIDATION_ERROR) com detalhes por campo
 - `429` — Limite de requisições excedido (RATE_LIMITED); veja o cabeçalho Retry-After
 
-## Serviços monitorados
+## Serviços (descoberta automática)
+
+### `GET /api/v1/servers/{id}/discovery`
+**Serviços do sistema descobertos automaticamente** — papel mínimo: **viewer**
+
+Nada precisa ser cadastrado: o agente procura sozinho `ssh`, `journald`, `cron`, `timesyncd`, `ufw`, `rsyslog`, `nginx`, `redis`, `docker` e `postgresql`. Redis e PostgreSQL, se não estiverem no host, são procurados em containers Docker. Sem relatório do agente ainda, `services` vem vazio e `checked_at` nulo (mostre "aguardando o agente").
+
+**Respostas**
+
+- `200` — `data`:
+
+| Campo | Tipo | Descrição |
+|---|---|---|
+| `summary` | `{total, available, unavailable}` | Contagens, para o cabeçalho do painel |
+| `checked_at` | string(date-time) \| null | Último relatório do agente |
+| `services[]` | DiscoveryItem | Na ordem do catálogo |
+
+`DiscoveryItem`:
+
+| Campo | Tipo | Descrição |
+|---|---|---|
+| `key` | string | `ssh`, `journald`, `cron`, `timesyncd`, `ufw`, `rsyslog`, `nginx`, `redis`, `docker`, `postgresql` |
+| `name` | string | Nome para exibir |
+| `available` | boolean | `true` = em execução |
+| `status` | string | `available` (em execução), `stopped` (instalado, mas parado/desativado), `not_found` (não instalado) |
+| `source` | string | Onde foi achado: `systemd`, `process` (processo no host) ou `docker` (container); vazio se não disponível |
+| `unit` | string | Unidade systemd, quando houver |
+| `action` | string | **O que fazer para ficar disponível** (comandos Debian/Ubuntu); vazio quando já está disponível |
+| `checked_at` / `status_changed_at` | string(date-time) | Última verificação / última mudança de `status` |
+
+**Alertas:** serviços que já estiveram disponíveis aparecem também em `GET /services` com `service_type: "discovered"` (nome "… (automático)"), e a queda deles gera alerta/incidente pela regra `service_down` (a migração cria a regra padrão "Serviço indisponível"). Quem nunca esteve disponível não alerta.
+
+Sugestão de tela: cartão verde para `available` (mostrando `source`) e cartão vermelho/âmbar para os demais, com `action` em um bloco de código copiável.
 
 ### `GET /api/v1/servers/{id}/services`
 **Serviços do servidor** — papel mínimo: **viewer**
@@ -818,7 +850,7 @@ Memória do balde = Σ usado / Σ total das amostras do balde.
 | `q` | query | string |  | Busca por nome ou alvo |
 | `server_id` | query | string(uuid) |  |  |
 | `status` | query | `up` \| `down` \| `degraded` \| `unknown` |  |  |
-| `service_type` | query | `http` \| `tcp` \| `systemd` |  |  |
+| `service_type` | query | `discovered` |  |  |
 
 **Respostas**
 
@@ -831,39 +863,6 @@ Memória do balde = Σ usado / Σ total das amostras do balde.
 
 - `401` — Credencial ausente, inválida, expirada ou revogada
 - `403` — Papel insuficiente (FORBIDDEN), token CSRF ausente/inválido (CSRF_INVALID) ou origem não permitida (ORIGIN_NOT_ALLOWED)
-- `422` — Dados inválidos (VALIDATION_ERROR) com detalhes por campo
-- `429` — Limite de requisições excedido (RATE_LIMITED); veja o cabeçalho Retry-After
-
-### `POST /api/v1/services`
-**Cadastra um serviço monitorado** — papel mínimo: **operator**
-
-- `http`: verificado **pela API**. O alvo passa por proteção anti-SSRF (só http/https, sem credenciais na URL,
-  sem localhost/IP privado/link-local/metadados; checado de novo no momento da conexão). Redirecionamentos não são seguidos.
-- `tcp`: verificado **pelo agente**, somente em loopback (`127.0.0.1:porta`).
-- `systemd`: verificado **pelo agente**, sem executar comandos (cgroup v2).
-Padrões: `timeout_seconds` 10 (http) ou 3, `interval_seconds` 60; o timeout padrão se ajusta a intervalos curtos.
-
-**Corpo (application/json)**
-
-| Campo | Tipo | Obrig. | Descrição |
-|---|---|---|---|
-| `server_id` | string(uuid) | sim |  |
-| `name` | string | sim |  |
-| `service_type` | `http` \| `tcp` \| `systemd` | sim |  |
-| `target` | string | sim | http: URL; tcp: 127.0.0.1:porta; systemd: nome da unidade |
-| `config` | ServiceConfig |  |  |
-
-**Respostas**
-
-- `201` — Criado
-
-| Campo | Tipo | Obrig. | Descrição |
-|---|---|---|---|
-| `data` | Service |  |  |
-
-- `401` — Credencial ausente, inválida, expirada ou revogada
-- `403` — Papel insuficiente (FORBIDDEN), token CSRF ausente/inválido (CSRF_INVALID) ou origem não permitida (ORIGIN_NOT_ALLOWED)
-- `409` — Nome já em uso (CONFLICT)
 - `422` — Dados inválidos (VALIDATION_ERROR) com detalhes por campo
 - `429` — Limite de requisições excedido (RATE_LIMITED); veja o cabeçalho Retry-After
 
@@ -889,91 +888,6 @@ Padrões: `timeout_seconds` 10 (http) ou 3, `interval_seconds` 60; o timeout pad
 - `403` — Papel insuficiente (FORBIDDEN), token CSRF ausente/inválido (CSRF_INVALID) ou origem não permitida (ORIGIN_NOT_ALLOWED)
 - `404` — Recurso não encontrado
 - `429` — Limite de requisições excedido (RATE_LIMITED); veja o cabeçalho Retry-After
-
-### `PATCH /api/v1/services/{id}`
-**Altera nome, alvo ou configuração (o tipo e o servidor não mudam)** — papel mínimo: **operator**
-
-**Parâmetros**
-
-| Nome | Em | Tipo | Obrig. | Descrição |
-|---|---|---|---|---|
-| `id` | path | string(uuid) | sim |  |
-
-**Corpo (application/json)**
-
-| Campo | Tipo | Obrig. | Descrição |
-|---|---|---|---|
-| `name` | string |  |  |
-| `target` | string |  |  |
-| `config` | ServiceConfig |  |  |
-
-**Respostas**
-
-- `200` — Serviço atualizado (reverificado em seguida)
-
-| Campo | Tipo | Obrig. | Descrição |
-|---|---|---|---|
-| `data` | Service |  |  |
-
-- `400` — Identificador inválido (INVALID_ID)
-- `401` — Credencial ausente, inválida, expirada ou revogada
-- `403` — Papel insuficiente (FORBIDDEN), token CSRF ausente/inválido (CSRF_INVALID) ou origem não permitida (ORIGIN_NOT_ALLOWED)
-- `404` — Recurso não encontrado
-- `409` — Nome já em uso (CONFLICT)
-- `422` — Dados inválidos (VALIDATION_ERROR) com detalhes por campo
-- `429` — Limite de requisições excedido (RATE_LIMITED); veja o cabeçalho Retry-After
-
-### `DELETE /api/v1/services/{id}`
-**Remove o serviço (exclusão lógica)** — papel mínimo: **operator**
-
-**Parâmetros**
-
-| Nome | Em | Tipo | Obrig. | Descrição |
-|---|---|---|---|---|
-| `id` | path | string(uuid) | sim |  |
-
-**Respostas**
-
-- `204` — Removido
-- `400` — Identificador inválido (INVALID_ID)
-- `401` — Credencial ausente, inválida, expirada ou revogada
-- `403` — Papel insuficiente (FORBIDDEN), token CSRF ausente/inválido (CSRF_INVALID) ou origem não permitida (ORIGIN_NOT_ALLOWED)
-- `404` — Recurso não encontrado
-- `429` — Limite de requisições excedido (RATE_LIMITED); veja o cabeçalho Retry-After
-
-### `POST /api/v1/services/{id}/check`
-**Executa agora a verificação de um serviço http** — papel mínimo: **operator**
-
-Serviços `tcp` e `systemd` são verificados pelo agente no próprio intervalo e respondem 409 `CHECK_NOT_CENTRAL`.
-
-**Parâmetros**
-
-| Nome | Em | Tipo | Obrig. | Descrição |
-|---|---|---|---|---|
-| `id` | path | string(uuid) | sim |  |
-
-**Respostas**
-
-- `200` — Resultado e serviço atualizado
-
-| Campo | Tipo | Obrig. | Descrição |
-|---|---|---|---|
-| `data` | object |  |  |
-| `data.service` | Service |  |  |
-| `data.result` | object |  |  |
-| `data.result.status` | `up` \| `down` \| `degraded` |  |  |
-| `data.result.latency_ms` | integer \| null |  |  |
-| `data.result.status_code` | integer \| null |  |  |
-| `data.result.error` | string \| null |  | Categoria genérica; nunca expõe endereços internos |
-
-- `400` — Identificador inválido (INVALID_ID)
-- `401` — Credencial ausente, inválida, expirada ou revogada
-- `403` — Papel insuficiente (FORBIDDEN), token CSRF ausente/inválido (CSRF_INVALID) ou origem não permitida (ORIGIN_NOT_ALLOWED)
-- `404` — Recurso não encontrado
-- `409` — Nome já em uso (CONFLICT)
-- `429` — Limite de requisições excedido (RATE_LIMITED); veja o cabeçalho Retry-After
-
-## Alertas e regras
 
 ### `GET /api/v1/alert-rules`
 **Lista regras de alerta** — papel mínimo: **viewer**
@@ -1669,41 +1583,12 @@ Memória usada = total − disponível.
 - `422` — Dados inválidos (VALIDATION_ERROR) com detalhes por campo
 - `429` — Limite de requisições excedido (RATE_LIMITED); veja o cabeçalho Retry-After
 
-### `POST /api/v1/agent/services`
-**Resultados das verificações locais (tcp/systemd)** — token do agente
+### `POST /api/v1/agent/discovery`
+**Serviços do sistema encontrados no host** — token do agente
 
-O agente só altera serviços do **próprio servidor** e apenas dos tipos verificados localmente. Itens recusados voltam em
-`rejected` com `reason` `unknown_service` (inexistente, de outro servidor ou de tipo central) ou `stale` (resultado mais
-antigo que o já gravado). `error` é sanitizado (sem caracteres de controle, máx. 200). Até 100 resultados por envio.
+Retrato completo dos serviços do catálogo (substitui o anterior). O agente só informa fatos de vocabulário fechado (`key`, `status`, `source`, `unit`); o texto de `action` é gerado pela API. Relatório mais antigo que o já gravado é ignorado.
 
-**Corpo (application/json)**
-
-| Campo | Tipo | Obrig. | Descrição |
-|---|---|---|---|
-| `checked_at` | string(date-time) | sim | Entre 1 h no passado e 2 min no futuro |
-| `results` | object[] | sim |  |
-| `results[].service_id` | string(uuid) | sim |  |
-| `results[].status` | `up` \| `down` \| `degraded` | sim |  |
-| `results[].latency_ms` | integer \| null |  |  |
-| `results[].error` | string |  |  |
-
-**Respostas**
-
-- `200` — Processado
-
-| Campo | Tipo | Obrig. | Descrição |
-|---|---|---|---|
-| `data` | object |  |  |
-| `data.accepted` | integer |  |  |
-| `data.rejected` | object[] |  |  |
-| `data.rejected[].service_id` | string(uuid) |  |  |
-| `data.rejected[].reason` | `unknown_service` \| `stale` |  |  |
-
-- `401` — Credencial ausente, inválida, expirada ou revogada
-- `403` — Servidor desativado (SERVER_DISABLED)
-- `413` — Corpo acima do limite (PAYLOAD_TOO_LARGE)
-- `422` — Dados inválidos (VALIDATION_ERROR) com detalhes por campo
-- `429` — Limite de requisições excedido (RATE_LIMITED); veja o cabeçalho Retry-After
+**Corpo (application/json)**: `{"checked_at": "...", "services": [{"key": "ssh", "status": "available", "source": "systemd", "unit": "ssh.service"}, {"key": "redis", "status": "not_found"}]}`
 
 ### `GET /api/v1/agent/config`
 **Parâmetros operacionais do agente (sem segredos nem comandos)** — token do agente
@@ -1719,7 +1604,6 @@ antigo que o já gravado). `error` é sanitizado (sem caracteres de controle, m�
 | `data.heartbeat_timeout_seconds` | integer |  |  |
 | `data.max_payload_bytes` | integer |  |  |
 | `data.max_disks` | integer |  |  |
-| `data.services` | AgentService[] |  | Serviços tcp/systemd deste servidor (apenas nomes e tempos; nunca comandos) |
 
 - `401` — Credencial ausente, inválida, expirada ou revogada
 - `403` — Servidor desativado (SERVER_DISABLED)
@@ -2021,24 +1905,12 @@ Tipo: `cpu_usage_percent` \| `memory_used_percent` \| `disk_used_percent` \| `lo
 
 ### ServiceConfig
 
+Mantido por compatibilidade; sem efeito (os serviços são descobertos automaticamente).
+
 | Campo | Tipo | Obrig. | Descrição |
 |---|---|---|---|
-| `timeout_seconds` | integer |  | Padrão 10 (http) ou 3; máx. 10 para tcp/systemd; sempre menor que o intervalo |
+| `timeout_seconds` | integer |  |  |
 | `interval_seconds` | integer |  |  |
-| `method` | `GET` \| `HEAD` |  | Somente http |
-| `expected_status` | integer[] |  | Somente http; padrão [200] |
-| `body_contains` | string |  | Somente http (GET); lê até 64 KiB do corpo |
-| `max_latency_ms` | integer |  | Somente http; acima disso o estado é degraded |
-
-### CreateService
-
-| Campo | Tipo | Obrig. | Descrição |
-|---|---|---|---|
-| `server_id` | string(uuid) | sim |  |
-| `name` | string | sim |  |
-| `service_type` | `http` \| `tcp` \| `systemd` | sim |  |
-| `target` | string | sim | http: URL; tcp: 127.0.0.1:porta; systemd: nome da unidade |
-| `config` | ServiceConfig |  |  |
 
 ### Service
 
@@ -2047,7 +1919,7 @@ Tipo: `cpu_usage_percent` \| `memory_used_percent` \| `disk_used_percent` \| `lo
 | `id` | string(uuid) |  |  |
 | `server_id` | string(uuid) |  |  |
 | `name` | string |  |  |
-| `service_type` | `http` \| `tcp` \| `systemd` |  |  |
+| `service_type` | `discovered` |  |  |
 | `target` | string |  |  |
 | `config` | ServiceConfig |  |  |
 | `status` | `unknown` \| `up` \| `down` \| `degraded` |  |  |
@@ -2059,28 +1931,6 @@ Tipo: `cpu_usage_percent` \| `memory_used_percent` \| `disk_used_percent` \| `lo
 | `status_changed_at` | string(date-time) \| null |  |  |
 | `created_at` | string(date-time) |  |  |
 | `updated_at` | string(date-time) |  |  |
-
-### AgentService
-
-| Campo | Tipo | Obrig. | Descrição |
-|---|---|---|---|
-| `id` | string(uuid) |  |  |
-| `name` | string |  |  |
-| `service_type` | `tcp` \| `systemd` |  |  |
-| `target` | string |  |  |
-| `timeout_seconds` | integer |  |  |
-| `interval_seconds` | integer |  |  |
-
-### AgentServiceReport
-
-| Campo | Tipo | Obrig. | Descrição |
-|---|---|---|---|
-| `checked_at` | string(date-time) | sim | Entre 1 h no passado e 2 min no futuro |
-| `results` | object[] | sim |  |
-| `results[].service_id` | string(uuid) | sim |  |
-| `results[].status` | `up` \| `down` \| `degraded` | sim |  |
-| `results[].latency_ms` | integer \| null |  |  |
-| `results[].error` | string |  |  |
 
 ### CreateAlertRule
 
@@ -2252,7 +2102,7 @@ service.status_changed (sem alvo nem mensagem de erro)
 | `server_id` | string(uuid) |  |  |
 | `server_name` | string |  |  |
 | `name` | string |  |  |
-| `service_type` | `http` \| `tcp` \| `systemd` |  |  |
+| `service_type` | `discovered` |  |  |
 | `previous_status` | `unknown` \| `up` \| `down` \| `degraded` |  |  |
 | `status` | `unknown` \| `up` \| `down` \| `degraded` |  |  |
 | `checked_at` | string(date-time) |  |  |

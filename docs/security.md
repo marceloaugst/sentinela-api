@@ -58,9 +58,9 @@ HTTPS é terminado no Nginx (a API escuta em `127.0.0.1`). Respostas levam `X-Co
 | Eventos SSE | Payloads mínimos, sem alvos de serviço, URLs, hostnames, mensagens de erro brutas ou notas de operadores. |
 | Logs | Contêm `user_id`/`actor` e `request_id`; não contêm corpo de requisição, cookies nem cabeçalhos de autorização. |
 
-## 6. Verificações de rede (SSRF), agente, injeção
-- Serviços `http`: validação no cadastro **e** na conexão (IP resolvido), sem redirecionamento nem proxy de ambiente, `SERVICE_CHECK_ALLOWED_CIDRS` vazio por padrão.
-- O agente não executa comandos; só conecta em loopback para `tcp` e consulta cgroups para `systemd`, e revalida cada alvo mesmo que a API o envie.
+## 6. Agente e injeção
+- A API **não faz requisições a alvos informados por usuários** (não há mais verificação `http` nem cadastro de serviços), então não há superfície de SSRF.
+- O agente não executa comandos nem abre conexões a pedido da API: a descoberta só lê `/proc`, cgroup e arquivos de unit. O texto "o que fazer" é gerado pela API a partir de um vocabulário fechado.
 - SQL: somente consultas parametrizadas; ordenações por lista permitida.
 
 ## 7. Auditoria

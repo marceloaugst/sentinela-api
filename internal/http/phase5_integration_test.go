@@ -306,13 +306,15 @@ func TestServiceAndServerStatusEvents(t *testing.T) {
 	e := newEnv(t, adminKey)
 	srv := e.createServer("web-1")
 	_, tok := e.issue(srv, nil)
-	svc := e.service(srv, "nginx", "systemd", "nginx")
 	c := e.stream("?types=service.status_changed,server.status_changed", nil)
 
 	report := func(status string) {
-		r := e.do("POST", "/api/v1/agent/services", tok, map[string]any{
-			"checked_at": time.Now().UTC().Format(time.RFC3339Nano),
-			"results":    []any{map[string]any{"service_id": svc, "status": status, "error": "http://10.0.0.5/segredo"}}})
+		f := map[string]any{"key": "nginx", "status": "available", "source": "systemd", "unit": "nginx.service"}
+		if status == "down" {
+			f = map[string]any{"key": "nginx", "status": "stopped", "unit": "nginx.service"}
+		}
+		r := e.do("POST", "/api/v1/agent/discovery", tok, map[string]any{
+			"checked_at": time.Now().UTC().Format(time.RFC3339Nano), "services": []any{f}})
 		if r.Status != 200 {
 			t.Fatalf("relatório: %d %s", r.Status, r.Raw)
 		}
@@ -321,10 +323,10 @@ func TestServiceAndServerStatusEvents(t *testing.T) {
 	report("up")
 	m := c.expect(events.TypeServiceStatus)
 	p := m.payload(t)
-	if p["service_id"] != svc || p["previous_status"] != "unknown" || p["status"] != "up" || p["name"] != "nginx" || p["server_name"] != "web-1" || p["service_type"] != "systemd" {
+	if p["service_id"] == nil || p["previous_status"] != "unknown" || p["status"] != "up" || p["name"] != "Nginx (automático)" || p["server_name"] != "web-1" || p["service_type"] != "discovered" {
 		t.Errorf("payload: %v", p)
 	}
-	if strings.Contains(m.Data, "10.0.0.5") || strings.Contains(m.Data, "target") || strings.Contains(m.Data, "segredo") {
+	if strings.Contains(m.Data, "nginx.service") || strings.Contains(m.Data, "target") || strings.Contains(m.Data, "parado") {
 		t.Errorf("o evento não pode vazar alvo/erro: %s", m.Data)
 	}
 	report("up") // mesmo estado: sem evento

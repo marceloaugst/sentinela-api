@@ -34,10 +34,10 @@ Papéis `viewer < operator < admin`; cada operação do OpenAPI declara `x-requi
 | GET | /api/v1/dashboard/metrics | Série agregada entre servidores (`server_id` opcional) |
 | GET | /api/v1/dashboard/recent-alerts | Alertas recentes (`limit`, `status`) |
 | GET | /api/v1/dashboard/recent-incidents | Incidentes recentes (`limit`, `status`) |
-| GET/POST | /api/v1/services | Listar (filtros) / cadastrar serviço monitorado (http, tcp, systemd) |
-| GET/PATCH/DELETE | /api/v1/services/{id} | Detalhe / alterar / exclusão lógica |
-| POST | /api/v1/services/{id}/check | Verifica agora (somente `http`) |
+| GET | /api/v1/services | Listar serviços (descobertos automaticamente; filtros) |
+| GET | /api/v1/services/{id} | Detalhe |
 | GET | /api/v1/servers/{id}/services | Serviços do servidor |
+| GET | /api/v1/servers/{id}/discovery | Serviços do sistema descobertos automaticamente (disponibilidade + o que fazer) |
 | GET | /api/v1/servers/{id}/incidents | Incidentes do servidor |
 | GET/POST | /api/v1/alert-rules | Listar / criar regras de alerta |
 | GET/PATCH/DELETE | /api/v1/alert-rules/{id} | Detalhe / alterar / exclusão lógica |
@@ -48,7 +48,7 @@ Papéis `viewer < operator < admin`; cada operação do OpenAPI declara `x-requi
 | GET/PATCH/DELETE | /api/v1/notification-channels/{id} | Detalhe / alterar / remover |
 | POST | /api/v1/notification-channels/{id}/test | Enfileira mensagem de teste |
 | GET | /api/v1/events | **Stream SSE** de eventos em tempo real (ver [events.md](events.md)); fora do envelope e sem timeout |
-| POST | /api/v1/agent/services | Resultados das verificações locais (tcp/systemd) |
+| POST | /api/v1/agent/discovery | Serviços do sistema encontrados no host |
 | POST | /api/v1/agent/heartbeat |
 | POST | /api/v1/agent/metrics | Amostra de métricas (idempotente) |
 | GET | /api/v1/agent/config | Parâmetros operacionais do agente |
@@ -64,7 +64,6 @@ Sucesso: `{"data": ..., "meta": ...}` (`meta` omitido quando vazio; listagens tr
 | SERVER_DISABLED | 403 | Servidor com `status=disabled` (agente) |
 | NOT_FOUND | 404 | Recurso inexistente ou removido |
 | INVALID_STATE | 409 | Alerta já resolvido (reconhecer/resolver) |
-| CHECK_NOT_CENTRAL | 409 | `POST /services/{id}/check` em serviço `tcp`/`systemd` |
 | SECRETS_NOT_CONFIGURED | 503 | `SECRETS_KEY` ausente ao gravar token de canal |
 | CONFLICT | 409 | Nome de servidor já em uso |
 | PAYLOAD_TOO_LARGE | 413 | Acima de `MAX_BODY_BYTES` (64 KiB para agentes) |
@@ -117,23 +116,13 @@ O resumo é calculado em **uma única consulta** (CTEs compartilhadas), sem cons
 ## Disponibilidade (`/servers/{id}/summary`)
 Janela de 24 h, mas nunca anterior ao cadastro do servidor. Cada amostra recebida em *t* mantém o servidor online até `min(próxima amostra, t + AGENT_HEARTBEAT_TIMEOUT_SECONDS)`; o resto é indisponibilidade. Usa o horário de **recebimento**, não o do agente. `percent` é `null` se a janela tiver menos de 1 minuto.
 
-## Serviços monitorados
-| Tipo | Quem verifica | Alvo | Observações |
-|---|---|---|---|
-| `http` | **API** (a cada `interval_seconds`, em lotes com concorrência limitada) | URL `http(s)` | Critérios: `expected_status` (padrão `[200]`), `body_contains`, `max_latency_ms` (acima = `degraded`), `method` GET/HEAD. Redirecionamentos **não** são seguidos (3xx é avaliado pelo `expected_status`). |
-| `tcp` | **Agente** | `127.0.0.1:porta` (somente loopback) | Conecta e fecha. |
-| `systemd` | **Agente**, sem executar comandos | nome da unidade | Considera `up` se existe `system.slice/<unidade>` no cgroup v2 (a unidade tem processos). Em hosts sem cgroup v2 o agente não reporta (evita falso `down`). |
+## Serviços (descoberta automática)
+Não há cadastro de serviços: o agente descobre sozinho ssh, systemd-journald, cron, systemd-timesyncd, ufw, rsyslog, nginx, redis, docker e postgresql (veja [agent.md](agent.md)). Cada serviço **que já foi visto disponível** aparece em `/services` com `service_type: "discovered"` e `status` `up`/`down`; quem nunca existiu no servidor só aparece em `GET /servers/{id}/discovery`, com o que fazer para ficar disponível.
 
-Todo serviço pertence a um servidor (os alertas precisam dele). Uma resposta HTTP 200 não significa aplicação saudável: use `body_contains` para exigir, por exemplo, `"db":"up"`.
-
-### Proteção contra SSRF (serviços `http`)
-1. **No cadastro/edição**: só `http`/`https`; sem usuário/senha na URL; porta válida; rejeita `localhost`, nomes `.local/.internal/.lan/...`, IPs literais privados, loopback, link-local (inclui `169.254.169.254`), CGNAT, multicast, reservados e IPv6 equivalentes (inclusive IPv4 mapeado em IPv6). Não resolve DNS (o cadastro não vira sonda).
-2. **Na conexão** (`net.Dialer.Control`, sobre o IP já resolvido): bloqueia o mesmo conjunto — cobre DNS que aponta para IP interno e *DNS rebinding*. Vale também para alvos que tenham entrado no banco por outro caminho.
-3. Proxies do ambiente são ignorados; sem redirecionamentos; corpo limitado a 64 KiB; erros devolvidos são categorias genéricas (nunca endereços internos).
-4. Exceção controlada pelo operador: `SERVICE_CHECK_ALLOWED_CIDRS` (ex.: `10.20.0.0/16`) autoriza redes internas específicas. Vazio por padrão.
+Serviços cadastrados manualmente antes dessa mudança (`http`, `tcp`, `systemd`) foram arquivados pela migração `0011` (exclusão lógica, nada foi apagado).
 
 ## Regras de alerta
-Métricas: `cpu_usage_percent`, `memory_used_percent`, `disk_used_percent` (pior volume; a mensagem cita o ponto de montagem), `load_average_1m`, `server_offline` (valor = segundos sem comunicação) e `service_down` (valor 1 = `down`). `server_id` omitido = regra **global**. Não há regras pré-cadastradas.
+Métricas: `cpu_usage_percent`, `memory_used_percent`, `disk_used_percent` (pior volume; a mensagem cita o ponto de montagem), `load_average_1m`, `server_offline` (valor = segundos sem comunicação) e `service_down` (valor 1 = `down`). `server_id` omitido = regra **global**. A migração `0010` cria uma regra global padrão, **"Serviço indisponível"** (`service_down`, crítica, 120 s para disparar), que cobre os serviços descobertos; as demais métricas não têm regra pré-cadastrada.
 
 ## Máquina de estados dos alertas
 ```

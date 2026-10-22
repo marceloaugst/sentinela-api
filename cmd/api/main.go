@@ -28,8 +28,6 @@ import (
 	"sentinela/internal/scheduler"
 	"sentinela/internal/secrets"
 	"sentinela/internal/servers"
-	"sentinela/internal/services"
-	"sentinela/internal/ssrf"
 	"sentinela/internal/telemetry"
 	"sentinela/internal/users"
 	"sentinela/migrations"
@@ -133,11 +131,6 @@ func run(args []string) error {
 			Batch: 10000, Log: log, Metrics: metrics, EventsRetention: cfg.EventsRetention,
 		}).Run(jobCtx)
 	})
-	runner := &services.Runner{
-		Repo: services.NewRepository(pool), Log: log,
-		Checker: services.NewChecker(ssrf.Policy{Allowed: cfg.ServiceCheckAllowed}),
-	}
-	spawn(func() { scheduler.Loop(jobCtx, "service_checks", 5*time.Second, metrics, log, runner.Tick) })
 	evaluator := &alerts.Evaluator{Pool: pool, Log: log, HeartbeatTimeout: cfg.AgentHeartbeatTimeout, Metrics: metrics}
 	spawn(func() {
 		scheduler.Loop(jobCtx, "alert_evaluation", cfg.AlertEvaluationInterval, metrics, log, evaluator.Tick)

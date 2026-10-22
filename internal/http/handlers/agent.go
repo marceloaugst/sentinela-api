@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"sentinela/internal/agents"
+	"sentinela/internal/discovery"
 	"sentinela/internal/events"
 	"sentinela/internal/http/response"
 	"sentinela/internal/metrics"
@@ -19,6 +20,7 @@ const MaxAgentBodyBytes = 64 << 10
 type Agent struct {
 	Metrics          *metrics.Repository
 	Services         *services.Repository
+	Discovery        *discovery.Repository
 	Log              *slog.Logger
 	CollectInterval  time.Duration
 	HeartbeatTimeout time.Duration
@@ -109,19 +111,10 @@ func (h Agent) PostMetrics(w http.ResponseWriter, r *http.Request) {
 // Config entrega apenas parâmetros operacionais não sensíveis. Nunca inclui segredos
 // nem instruções/comandos para execução.
 func (h Agent) Config(w http.ResponseWriter, r *http.Request) {
-	id, ok := identity(w, r)
-	if !ok {
-		return
-	}
-	// Serviços a verificar localmente: apenas nomes e tempos; o agente decide como verificar.
-	svcs, err := h.Services.ForAgent(r.Context(), id.ServerID)
-	if err != nil {
-		h.Log.Error("falha ao listar serviços do agente", "err", err, "server_id", id.ServerID)
-		response.Internal(w)
+	if _, ok := identity(w, r); !ok {
 		return
 	}
 	response.JSON(w, http.StatusOK, map[string]any{
-		"services":                  svcs,
 		"collect_interval_seconds":  int(h.CollectInterval.Seconds()),
 		"heartbeat_timeout_seconds": int(h.HeartbeatTimeout.Seconds()),
 		"max_payload_bytes":         MaxAgentBodyBytes,
@@ -129,14 +122,14 @@ func (h Agent) Config(w http.ResponseWriter, r *http.Request) {
 	}, nil)
 }
 
-// POST /agent/services: resultados das verificações locais (tcp/systemd). O agente só altera
-// serviços do próprio servidor; ids desconhecidos ou resultados mais antigos são recusados.
-func (h Agent) PostServices(w http.ResponseWriter, r *http.Request) {
+// POST /agent/discovery: retrato dos serviços do sistema encontrados pelo agente. O servidor vem
+// da credencial; o agente só informa fatos de um vocabulário fechado.
+func (h Agent) PostDiscovery(w http.ResponseWriter, r *http.Request) {
 	id, ok := identity(w, r)
 	if !ok {
 		return
 	}
-	var rep services.AgentReport
+	var rep discovery.Report
 	if !response.Decode(w, r, &rep) {
 		return
 	}
@@ -144,14 +137,36 @@ func (h Agent) PostServices(w http.ResponseWriter, r *http.Request) {
 		response.Validation(w, p)
 		return
 	}
-	accepted, rejected, err := h.Services.RecordAgentReport(r.Context(), id.ServerID, rep)
-	if err != nil {
-		h.Log.Error("falha ao gravar serviços do agente", "err", err, "server_id", id.ServerID)
+	if err := h.Discovery.Replace(r.Context(), id.ServerID, rep); err != nil {
+		h.Log.Error("falha ao gravar descoberta de serviços", "err", err, "server_id", id.ServerID)
 		response.Internal(w)
 		return
 	}
-	if rejected == nil {
-		rejected = []services.Rejected{}
+	// Liga a descoberta aos alertas: falha aqui não desfaz o retrato já gravado (o próximo relatório repete).
+	if err := h.Services.SyncDiscovered(r.Context(), id.ServerID, discoveredStates(rep), rep.CheckedAt); err != nil {
+		h.Log.Error("falha ao sincronizar serviços descobertos", "err", err, "server_id", id.ServerID)
 	}
-	response.JSON(w, http.StatusOK, map[string]any{"accepted": accepted, "rejected": rejected}, nil)
+	response.JSON(w, http.StatusOK, map[string]any{"stored": len(rep.Services)}, nil)
+}
+
+func discoveredStates(rep discovery.Report) []services.Discovered {
+	out := make([]services.Discovered, 0, len(rep.Services))
+	for _, f := range rep.Services {
+		spec, ok := discovery.Lookup(f.Key)
+		if !ok {
+			continue
+		}
+		d := services.Discovered{Key: f.Key, Name: spec.Name, Target: f.Unit, Up: f.Status == discovery.StatusAvailable}
+		if d.Target == "" {
+			d.Target = f.Key
+		}
+		switch f.Status {
+		case discovery.StatusStopped:
+			d.Reason = "instalado, mas parado ou desativado"
+		case discovery.StatusNotFound:
+			d.Reason = "não encontrado (parou ou foi removido)"
+		}
+		out = append(out, d)
+	}
+	return out
 }

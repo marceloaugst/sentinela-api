@@ -376,10 +376,10 @@ func TestAuthorizationMatrixCoversEveryRoute(t *testing.T) {
 	}
 	// papéis de cada categoria de recurso (documenta a política)
 	want := map[string]auth.Role{
-		"GET /api/v1/servers": auth.Viewer, "POST /api/v1/servers": auth.Admin, "POST /api/v1/services": auth.Operator,
+		"GET /api/v1/servers": auth.Viewer, "POST /api/v1/servers": auth.Admin, "POST /api/v1/alert-rules": auth.Operator,
 		"POST /api/v1/alerts/{id}/acknowledge": auth.Operator, "GET /api/v1/notification-channels": auth.Admin,
 		"GET /api/v1/servers/{id}/agent-credentials": auth.Admin, "GET /api/v1/users": auth.Admin, "GET /api/v1/audit-logs": auth.Admin,
-		"GET /api/v1/events": auth.Viewer, "POST /api/v1/alert-rules": auth.Operator,
+		"GET /api/v1/events": auth.Viewer,
 	}
 	for _, rt := range routes {
 		if w, ok := want[rt.Method+" "+rt.Path]; ok && rt.Role != w {
@@ -502,13 +502,13 @@ func TestUsersAPI(t *testing.T) {
 	bi := &actor{e: e, t: t, Email: "bia@exemplo.com", Password: "violeta-quente-rio-2026", client: &nethttp.Client{}}
 	bi.client.Jar, _ = cookiejar.New(nil)
 	bi.mustLogin()
-	if r := bi.do("POST", "/api/v1/services", `{}`); r.Status != 422 { // operador passa da autorização
-		t.Fatalf("operador cria serviço: %d", r.Status)
+	if r := bi.do("POST", "/api/v1/alert-rules", `{}`); r.Status != 422 { // operador passa da autorização
+		t.Fatalf("operador cria regra: %d", r.Status)
 	}
 	if r := admin.do("PATCH", "/api/v1/users/"+bia, map[string]string{"role": "viewer"}); r.Status != 200 {
 		t.Fatal(r.Raw)
 	}
-	if r := bi.do("POST", "/api/v1/services", `{}`); r.Status != 403 {
+	if r := bi.do("POST", "/api/v1/alert-rules", `{}`); r.Status != 403 {
 		t.Errorf("após o rebaixamento, a MESMA sessão deveria perder o acesso: %d", r.Status)
 	}
 

@@ -63,12 +63,12 @@ func TestLoadPhase4(t *testing.T) {
 	key := strings.Repeat("ab", 32)
 	c, err := Load(env(map[string]string{
 		"DATABASE_URL": "x", "SECRETS_KEY": key, "TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "-100",
-		"TELEGRAM_ALLOWED_CHAT_IDS": "42, 43", "SERVICE_CHECK_ALLOWED_CIDRS": "10.0.0.0/24",
+		"TELEGRAM_ALLOWED_CHAT_IDS": "42, 43",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(c.SecretsKey) != 32 || len(c.ServiceCheckAllowed) != 1 {
+	if len(c.SecretsKey) != 32 {
 		t.Errorf("%+v", c)
 	}
 	// o chat do ambiente entra na lista de autorizados
@@ -82,7 +82,6 @@ func TestLoadPhase4(t *testing.T) {
 		"token sem chave":   {"DATABASE_URL": "x", "TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "1"},
 		"token sem chat":    {"DATABASE_URL": "x", "TELEGRAM_BOT_TOKEN": "t", "SECRETS_KEY": key},
 		"chave inválida":    {"DATABASE_URL": "x", "SECRETS_KEY": "curta"},
-		"cidr inválido":     {"DATABASE_URL": "x", "SERVICE_CHECK_ALLOWED_CIDRS": "10.0.0.0/99"},
 		"api base inválida": {"DATABASE_URL": "x", "TELEGRAM_API_BASE": "ftp://x"},
 		"avaliação rápida":  {"DATABASE_URL": "x", "ALERT_EVALUATION_INTERVAL_SECONDS": "1"},
 	} {

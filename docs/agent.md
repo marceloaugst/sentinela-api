@@ -26,6 +26,28 @@ Binário Go independente (`cmd/agent`), sem dependências externas além da bibl
 | Discos | `/proc/mounts` + `statfs` | Só ext*/xfs/btrfs/zfs/f2fs/vfat/ntfs…; bind mounts e subvolumes do mesmo dispositivo são deduplicados (fica o caminho mais curto); máximo de 64 |
 | Sistema | `/etc/os-release`, `os.Hostname`, `GOARCH` | |
 
+## Descoberta automática de serviços
+Sem cadastro: a cada minuto o agente procura no próprio host ssh, systemd-journald, cron, systemd-timesyncd, ufw, rsyslog, nginx, redis, docker e postgresql, e envia o retrato a `POST /agent/discovery` quando algo muda (ou a cada 5 min). A tela lê `GET /servers/{id}/discovery`.
+
+| Como é achado | Fonte |
+|---|---|
+| Unidade em execução | cgroup `system.slice/<unidade>` (inclui instâncias como `postgresql@16-main`) |
+| Instalado, mas parado | arquivo de unit em `/etc/systemd/system`, `/run/systemd/system`, `/usr/lib/systemd/system`, `/lib/systemd/system` |
+| Processo no host | `/proc/<pid>/comm` |
+| Ativação por socket (ex.: `ssh.socket`) | unit existe e a porta está em `LISTEN` em `/proc/net/tcp{,6}` |
+| UFW | `ENABLED` em `/etc/ufw/ufw.conf` (o serviço é *oneshot*, sem processo) |
+| **Redis/PostgreSQL em Docker** (quando não estão no host) | processo do serviço em cgroup `docker-*.scope`/`/docker/`, ou `docker-proxy` publicando a porta 6379/5432 (`-container-port` em `/proc/<pid>/cmdline`) |
+
+O agente **não usa o socket do Docker** (dar acesso a ele equivale a root) e não executa comandos. Limite conhecido: um container de Redis/PostgreSQL **parado** não é visível sem o socket; aparece como `not_found`, e a dica já sugere o `docker run`. ### Ligação com os alertas
+Cada serviço descoberto que **já foi visto disponível** vira um serviço monitorado do tipo `discovered` (nome "SSH (automático)", etc.). Se depois ele ficar `stopped` ou `not_found`, o serviço passa a `down`, e a regra `service_down` abre alerta, incidente e notificação (Telegram etc.). Detalhes:
+- Quem **nunca existiu** no servidor (ex.: Redis não instalado) não gera alerta, só aparece como indisponível com o "o que fazer".
+- A migração `0010` cria a regra global **"Serviço indisponível"** (`service_down`, crítica, 120 s para disparar, 60 s para recuperar) se ainda não houver nenhuma regra `service_down`. Ajuste ou desative em `/alert-rules`.
+- Não há cadastro, edição nem exclusão de serviços pela API: a lista é sempre o que o agente encontra. Serviços cadastrados antes (`http`/`tcp`/`systemd`) foram arquivados pela migração `0011`.
+- O agente não verifica mais URLs `http` nem portas `tcp` a pedido da API; `GET /agent/config` só devolve parâmetros operacionais.
+- Servidor offline não gera alerta de serviço (só o de `server_offline`).
+
+O texto "o que fazer" (`action`) é gerado pela API, nunca enviado pelo agente.
+
 ## Envio e resiliência
 - Uma coleta por intervalo; o envio inteiro (com retentativas) fica limitado ao intervalo, então não há acúmulo de fila nem de memória (`GOMEMLIMIT` interno de 64 MiB).
 - Falhas transitórias (rede, 408, 429, 5xx) → backoff exponencial com jitter (1 s, 2 s, 4 s… teto 30 s, até 4 tentativas); `Retry-After` é respeitado.
@@ -47,11 +69,6 @@ MemoryMax=96M
 Restart=always
 ```
 (`DynamicUser` precisa de `LoadCredential=` ou de um arquivo legível por esse usuário para o token.)
-
-## Verificação de serviços locais (Fase 4)
-O agente recebe em `GET /agent/config` a lista de serviços `tcp`/`systemd` do **seu** servidor (apenas id, nome, tipo, alvo e tempos) e envia os resultados em lote a `POST /agent/services`, no intervalo de cada serviço. A lista é atualizada a cada 60 s (ou na hora, se a API recusar algum resultado).
-
-Segurança: a API diz *qual* serviço verificar; o agente decide *como*, com código próprio, e **revalida** cada alvo — `tcp` só conecta em loopback e `systemd` só aceita nomes `[A-Za-z0-9:_.@-]`, consultando o cgroup em vez de executar `systemctl`. Mesmo uma API comprometida não consegue fazer o agente conectar em outro host ou executar um comando.
 
 ## Envio de logs (nginx, fail2ban, ufw)
 Opcional e desativado por padrão: `SENTINELA_LOGS=nginx,fail2ban,ufw`. O agente só **lê** os arquivos de log e confirma cada lote com a API antes de avançar a posição. Variáveis, formato e garantias em [logs.md](logs.md).

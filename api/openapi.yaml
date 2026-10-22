@@ -853,6 +853,35 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "422": { $ref: "#/components/responses/Validation" }
 
+  /api/v1/servers/{id}/discovery:
+    parameters:
+      - { $ref: "#/components/parameters/ServerId" }
+    get:
+      tags: [services]
+      summary: Serviços do sistema descobertos automaticamente
+      description: |
+        O agente procura sozinho ssh, systemd-journald, cron, systemd-timesyncd, ufw, rsyslog, nginx, redis, docker e
+        postgresql — nada precisa ser cadastrado. Redis e PostgreSQL, se não estiverem no host, são procurados em containers
+        Docker. Cada item traz `available` e, quando indisponível, `action` com o que fazer. Sem relatório do agente,
+        `services` vem vazio e `checked_at` nulo.
+      operationId: listServerDiscovery
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Serviços descobertos
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: "#/components/schemas/ServerDiscovery" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
   /api/v1/servers/{id}/services:
     parameters:
       - { $ref: "#/components/parameters/ServerId" }
@@ -926,7 +955,7 @@ paths:
         - { name: q, in: query, description: Busca por nome ou alvo, schema: { type: string, maxLength: 120 } }
         - { name: server_id, in: query, schema: { type: string, format: uuid } }
         - { name: status, in: query, schema: { type: string, enum: [up, down, degraded, unknown] } }
-        - { name: service_type, in: query, schema: { type: string, enum: [http, tcp, systemd] } }
+        - { name: service_type, in: query, schema: { type: string, enum: [discovered] } }
       responses:
         "403": { $ref: "#/components/responses/Forbidden" }
         "429": { $ref: "#/components/responses/RateLimited" }
@@ -941,38 +970,6 @@ paths:
                   data: { type: array, items: { $ref: "#/components/schemas/Service" } }
                   meta: { $ref: "#/components/schemas/PageMeta" }
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "422": { $ref: "#/components/responses/Validation" }
-    post:
-      tags: [services]
-      summary: Cadastra um serviço monitorado
-      description: |
-        - `http`: verificado **pela API**. O alvo passa por proteção anti-SSRF (só http/https, sem credenciais na URL,
-          sem localhost/IP privado/link-local/metadados; checado de novo no momento da conexão). Redirecionamentos não são seguidos.
-        - `tcp`: verificado **pelo agente**, somente em loopback (`127.0.0.1:porta`).
-        - `systemd`: verificado **pelo agente**, sem executar comandos (cgroup v2).
-        Padrões: `timeout_seconds` 10 (http) ou 3, `interval_seconds` 60; o timeout padrão se ajusta a intervalos curtos.
-      operationId: createService
-      x-required-role: operator
-      security: [{ sessionAuth: [] }, { adminKey: [] }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/CreateService" }
-            example: { server_id: "00000000-0000-0000-0000-000000000001", name: api, service_type: http, target: "https://api.example.com/health", config: { interval_seconds: 30, expected_status: [200], body_contains: '"db":"up"', max_latency_ms: 800 } }
-      responses:
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "429": { $ref: "#/components/responses/RateLimited" }
-        "201":
-          description: Criado
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  data: { $ref: "#/components/schemas/Service" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "409": { $ref: "#/components/responses/Conflict" }
         "422": { $ref: "#/components/responses/Validation" }
   /api/v1/services/{id}:
     parameters:
@@ -997,88 +994,6 @@ paths:
         "400": { $ref: "#/components/responses/InvalidId" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
-    patch:
-      tags: [services]
-      summary: Altera nome, alvo ou configuração (o tipo e o servidor não mudam)
-      operationId: updateService
-      x-required-role: operator
-      security: [{ sessionAuth: [] }, { adminKey: [] }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              minProperties: 1
-              properties:
-                name: { type: string }
-                target: { type: string }
-                config: { $ref: "#/components/schemas/ServiceConfig" }
-      responses:
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "429": { $ref: "#/components/responses/RateLimited" }
-        "200":
-          description: Serviço atualizado (reverificado em seguida)
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  data: { $ref: "#/components/schemas/Service" }
-        "400": { $ref: "#/components/responses/InvalidId" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "404": { $ref: "#/components/responses/NotFound" }
-        "409": { $ref: "#/components/responses/Conflict" }
-        "422": { $ref: "#/components/responses/Validation" }
-    delete:
-      tags: [services]
-      summary: Remove o serviço (exclusão lógica)
-      operationId: deleteService
-      x-required-role: operator
-      security: [{ sessionAuth: [] }, { adminKey: [] }]
-      responses:
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "429": { $ref: "#/components/responses/RateLimited" }
-        "204": { description: Removido }
-        "400": { $ref: "#/components/responses/InvalidId" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "404": { $ref: "#/components/responses/NotFound" }
-  /api/v1/services/{id}/check:
-    parameters:
-      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
-    post:
-      tags: [services]
-      summary: Executa agora a verificação de um serviço http
-      description: Serviços `tcp` e `systemd` são verificados pelo agente no próprio intervalo e respondem 409 `CHECK_NOT_CENTRAL`.
-      operationId: checkService
-      x-required-role: operator
-      security: [{ sessionAuth: [] }, { adminKey: [] }]
-      responses:
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "429": { $ref: "#/components/responses/RateLimited" }
-        "200":
-          description: Resultado e serviço atualizado
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  data:
-                    type: object
-                    properties:
-                      service: { $ref: "#/components/schemas/Service" }
-                      result:
-                        type: object
-                        properties:
-                          status: { type: string, enum: [up, down, degraded] }
-                          latency_ms: { type: integer, nullable: true }
-                          status_code: { type: integer, nullable: true }
-                          error: { type: string, nullable: true, description: Categoria genérica; nunca expõe endereços internos }
-        "400": { $ref: "#/components/responses/InvalidId" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "404": { $ref: "#/components/responses/NotFound" }
-        "409": { $ref: "#/components/responses/Conflict" }
-
   /api/v1/alert-rules:
     get:
       tags: [alerts]
@@ -1655,24 +1570,23 @@ paths:
         "413": { $ref: "#/components/responses/TooLarge" }
         "422": { $ref: "#/components/responses/Validation" }
         "429": { $ref: "#/components/responses/RateLimited" }
-  /api/v1/agent/services:
+  /api/v1/agent/discovery:
     post:
       tags: [agent]
-      summary: Resultados das verificações locais (tcp/systemd)
+      summary: Serviços do sistema encontrados no host
       description: |
-        O agente só altera serviços do **próprio servidor** e apenas dos tipos verificados localmente. Itens recusados voltam em
-        `rejected` com `reason` `unknown_service` (inexistente, de outro servidor ou de tipo central) ou `stale` (resultado mais
-        antigo que o já gravado). `error` é sanitizado (sem caracteres de controle, máx. 200). Até 100 resultados por envio.
-      operationId: agentServices
+        Retrato completo dos serviços do catálogo (substitui o anterior). O agente só informa fatos de vocabulário fechado
+        (`status`, `source`, `unit`); o texto de `action` é gerado pela API. Um relatório mais antigo que o já gravado é ignorado.
+      operationId: agentDiscovery
       security: [{ agentToken: [] }]
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: "#/components/schemas/AgentServiceReport" }
+            schema: { $ref: "#/components/schemas/AgentDiscoveryReport" }
       responses:
         "200":
-          description: Processado
+          description: Gravado
           content:
             application/json:
               schema:
@@ -1681,14 +1595,7 @@ paths:
                   data:
                     type: object
                     properties:
-                      accepted: { type: integer }
-                      rejected:
-                        type: array
-                        items:
-                          type: object
-                          properties:
-                            service_id: { type: string, format: uuid }
-                            reason: { type: string, enum: [unknown_service, stale] }
+                      stored: { type: integer }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/ServerDisabled" }
         "413": { $ref: "#/components/responses/TooLarge" }
@@ -1750,10 +1657,6 @@ paths:
                       heartbeat_timeout_seconds: { type: integer, example: 60 }
                       max_payload_bytes: { type: integer, example: 65536 }
                       max_disks: { type: integer, example: 64 }
-                      services:
-                        type: array
-                        description: Serviços tcp/systemd deste servidor (apenas nomes e tempos; nunca comandos)
-                        items: { $ref: "#/components/schemas/AgentService" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/ServerDisabled" }
         "429": { $ref: "#/components/responses/RateLimited" }
@@ -2105,30 +2008,18 @@ components:
     MetricName: { type: string, enum: [cpu_usage_percent, memory_used_percent, disk_used_percent, load_average_1m, server_offline, service_down] }
     ServiceConfig:
       type: object
+      description: Mantido por compatibilidade; sem efeito (os serviços são descobertos automaticamente)
       properties:
-        timeout_seconds: { type: integer, minimum: 1, maximum: 30, description: "Padrão 10 (http) ou 3; máx. 10 para tcp/systemd; sempre menor que o intervalo" }
-        interval_seconds: { type: integer, minimum: 10, maximum: 3600, default: 60 }
-        method: { type: string, enum: [GET, HEAD], description: Somente http }
-        expected_status: { type: array, items: { type: integer, minimum: 100, maximum: 599 }, maxItems: 20, description: "Somente http; padrão [200]" }
-        body_contains: { type: string, maxLength: 256, description: "Somente http (GET); lê até 64 KiB do corpo" }
-        max_latency_ms: { type: integer, minimum: 0, maximum: 60000, description: "Somente http; acima disso o estado é degraded" }
-    CreateService:
-      type: object
-      required: [server_id, name, service_type, target]
-      properties:
-        server_id: { type: string, format: uuid }
-        name: { type: string, minLength: 1, maxLength: 120 }
-        service_type: { type: string, enum: [http, tcp, systemd] }
-        target: { type: string, description: "http: URL; tcp: 127.0.0.1:porta; systemd: nome da unidade" }
-        config: { $ref: "#/components/schemas/ServiceConfig" }
+        timeout_seconds: { type: integer }
+        interval_seconds: { type: integer }
     Service:
       type: object
       properties:
         id: { type: string, format: uuid }
         server_id: { type: string, format: uuid }
         name: { type: string }
-        service_type: { type: string, enum: [http, tcp, systemd] }
-        target: { type: string }
+        service_type: { type: string, enum: [discovered] }
+        target: { type: string, description: Unidade systemd (ou a chave do serviço) }
         config: { $ref: "#/components/schemas/ServiceConfig" }
         status: { type: string, enum: [unknown, up, down, degraded] }
         last_checked_at: { type: string, format: date-time, nullable: true }
@@ -2139,32 +2030,56 @@ components:
         status_changed_at: { type: string, format: date-time, nullable: true }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
-    AgentService:
+    AgentDiscoveryReport:
       type: object
-      properties:
-        id: { type: string, format: uuid }
-        name: { type: string }
-        service_type: { type: string, enum: [tcp, systemd] }
-        target: { type: string }
-        timeout_seconds: { type: integer }
-        interval_seconds: { type: integer }
-    AgentServiceReport:
-      type: object
-      required: [checked_at, results]
+      required: [checked_at, services]
       properties:
         checked_at: { type: string, format: date-time, description: Entre 1 h no passado e 2 min no futuro }
-        results:
+        services:
           type: array
           minItems: 1
-          maxItems: 100
+          maxItems: 10
           items:
             type: object
-            required: [service_id, status]
+            required: [key, status]
             properties:
-              service_id: { type: string, format: uuid }
-              status: { type: string, enum: [up, down, degraded] }
-              latency_ms: { type: integer, minimum: 0, maximum: 600000, nullable: true }
-              error: { type: string, maxLength: 200 }
+              key: { $ref: "#/components/schemas/DiscoveryKey" }
+              status: { $ref: "#/components/schemas/DiscoveryStatus" }
+              source: { type: string, enum: [systemd, process, docker], description: Obrigatório quando disponível; proibido quando não encontrado }
+              unit: { type: string, maxLength: 128 }
+    DiscoveryKey:
+      type: string
+      enum: [ssh, journald, cron, timesyncd, ufw, rsyslog, nginx, redis, docker, postgresql]
+    DiscoveryStatus:
+      type: string
+      enum: [available, stopped, not_found]
+      description: "`available` em execução; `stopped` instalado mas parado/desativado; `not_found` não instalado (nem em container, para redis e postgresql)"
+    DiscoveryItem:
+      type: object
+      required: [key, name, available, status, source, unit, action, checked_at, status_changed_at]
+      properties:
+        key: { $ref: "#/components/schemas/DiscoveryKey" }
+        name: { type: string }
+        available: { type: boolean }
+        status: { $ref: "#/components/schemas/DiscoveryStatus" }
+        source: { type: string, enum: ["", systemd, process, docker], description: Onde foi encontrado }
+        unit: { type: string, description: Unidade systemd, quando houver }
+        action: { type: string, description: O que fazer para ficar disponível (vazio quando já está) }
+        checked_at: { type: string, format: date-time }
+        status_changed_at: { type: string, format: date-time, nullable: true }
+    ServerDiscovery:
+      type: object
+      required: [summary, services, checked_at]
+      properties:
+        summary:
+          type: object
+          required: [total, available, unavailable]
+          properties:
+            total: { type: integer }
+            available: { type: integer }
+            unavailable: { type: integer }
+        services: { type: array, items: { $ref: "#/components/schemas/DiscoveryItem" } }
+        checked_at: { type: string, format: date-time, nullable: true }
     CreateAlertRule:
       type: object
       required: [name, metric_name, operator, threshold, severity]
@@ -2406,7 +2321,7 @@ components:
         server_id: { type: string, format: uuid }
         server_name: { type: string }
         name: { type: string }
-        service_type: { type: string, enum: [http, tcp, systemd] }
+        service_type: { type: string, enum: [discovered] }
         previous_status: { type: string, enum: [unknown, up, down, degraded] }
         status: { type: string, enum: [unknown, up, down, degraded] }
         checked_at: { type: string, format: date-time }
