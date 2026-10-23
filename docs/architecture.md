@@ -23,7 +23,7 @@
 | Proteção do admin | *(substituída na Fase 6 por usuários, sessões e papéis; veja abaixo)* A chave estática `ADMIN_API_KEY` continua existindo apenas como credencial de automação opcional, desativada por padrão. |
 | Credencial de agente | `snt_` + 256 bits aleatórios; guarda-se SHA-256. Emitir com `replace` revoga as anteriores na mesma transação. Servidor excluído/desativado invalida o acesso. `last_used_at` é atualizado no máximo 1×/min. |
 | Isolamento | O `server_id` vem só da credencial; `DisallowUnknownFields` rejeita tentativas de enviar outro identificador. |
-| Rate limiting | Token bucket em memória: por IP (antes de consultar o banco, contém tentativas com token inválido) e por credencial (`AGENT_RATE_LIMIT_*`). Limitação: o estado é por instância; com várias instâncias da API, usar Redis (fase futura). IP real só com `TRUST_PROXY=true` atrás do Nginx (`X-Real-IP`). |
+| Rate limiting | Token bucket em memória: por IP (antes de consultar o banco, contém tentativas com token inválido) e por credencial (`AGENT_RATE_LIMIT_*`); o limite por IP é `AGENT_IP_RATE_LIMIT_*` (20/s, rajada 60). Limitação: o estado é por instância; com várias instâncias da API, usar Redis (fase futura). IP real só com `TRUST_PROXY=true` atrás do Nginx (`X-Real-IP`). |
 | Idempotência | `INSERT ... ON CONFLICT (server_id, collected_at) DO NOTHING`; reenvio devolve `duplicate: true`. Testado com 20 gravações concorrentes da mesma amostra. |
 | Discos | UPSERT por `(server_id, mount_point)` só se a amostra não for mais antiga que a gravada; volumes ausentes na coleta mais recente são removidos. |
 | Auditoria | Gravada na **mesma transação** da ação; chaves com `token/password/secret/key/hash` são sobrescritas por `[redacted]`. |

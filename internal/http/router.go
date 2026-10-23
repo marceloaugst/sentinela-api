@@ -312,6 +312,9 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 	if cfg.AgentRatePerSecond > 0 && cfg.AgentRateBurst > 0 { // zero => padrões do NewAuth
 		agentAuth.ByCred = ratelimit.New(float64(cfg.AgentRatePerSecond), cfg.AgentRateBurst)
 	}
+	if cfg.AgentIPRatePerSecond > 0 && cfg.AgentIPRateBurst > 0 {
+		agentAuth.ByIP = ratelimit.New(float64(cfg.AgentIPRatePerSecond), cfg.AgentIPRateBurst)
+	}
 	agh := handlers.Agent{
 		Metrics: metRepo, Services: svcRepo, Discovery: discRepo, Docker: dockRepo, Procs: procRepo, ProcHistory: procHist, SvcCommands: actRepo, Log: d.Log,
 		CollectInterval: cfg.AgentCollectInterval, HeartbeatTimeout: cfg.AgentHeartbeatTimeout,

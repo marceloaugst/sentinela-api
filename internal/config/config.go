@@ -44,6 +44,8 @@ type Config struct {
 	TrustProxy           bool // confia em X-Real-IP (só atrás de um proxy confiável)
 	AgentRatePerSecond   int  // limite por credencial de agente
 	AgentRateBurst       int
+	AgentIPRatePerSecond int // limite por IP de origem (antes da consulta ao banco)
+	AgentIPRateBurst     int
 
 	// Fase 4
 	SecretsKey              []byte // chave AES-256 para segredos em repouso (nil = ausente)
@@ -158,6 +160,8 @@ func Load(getenv func(string) string) (Config, error) {
 		TrustProxy:           boolean("TRUST_PROXY", false),
 		AgentRatePerSecond:   integer("AGENT_RATE_LIMIT_PER_SECOND", 2),
 		AgentRateBurst:       integer("AGENT_RATE_LIMIT_BURST", 10),
+		AgentIPRatePerSecond: integer("AGENT_IP_RATE_LIMIT_PER_SECOND", 20),
+		AgentIPRateBurst:     integer("AGENT_IP_RATE_LIMIT_BURST", 60),
 
 		AutoMigrate: boolean("AUTO_MIGRATE", false),
 		LogLevel:    str("LOG_LEVEL", "info"),
@@ -319,6 +323,9 @@ func (c Config) validate() error {
 	}
 	if c.AgentRatePerSecond < 1 || c.AgentRateBurst < 1 {
 		errs = append(errs, errors.New("AGENT_RATE_LIMIT_PER_SECOND e AGENT_RATE_LIMIT_BURST devem ser >= 1"))
+	}
+	if c.AgentIPRatePerSecond < 1 || c.AgentIPRateBurst < 1 {
+		errs = append(errs, errors.New("AGENT_IP_RATE_LIMIT_PER_SECOND e AGENT_IP_RATE_LIMIT_BURST devem ser >= 1"))
 	}
 	for _, o := range c.CORSAllowedOrigins {
 		if o == "*" && c.IsProduction() {
