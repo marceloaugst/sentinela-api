@@ -2,7 +2,8 @@
 # Cadastra ESTA máquina no Sentinela e instala o agente como serviço (systemd), falando com a API por localhost.
 #   ./deploy/setup-local-agent.sh
 # Pede apenas a senha do painel (sem eco). Variáveis opcionais: ADMIN_EMAIL, API_PORT, SERVER_NAME,
-# AGENT_LOGS (fontes de log a enviar; padrão: as que existem nesta máquina entre nginx, fail2ban e ufw; "none" desliga).
+# AGENT_LOGS (fontes de log a enviar; padrão: as que existem nesta máquina entre nginx, fail2ban e ufw; "none" desliga),
+# AGENT_DOCKER=yes (deixa o agente listar/iniciar/reiniciar containers: dá acesso ao socket do Docker, que equivale a root).
 set -euo pipefail
 
 ADMIN_EMAIL="${ADMIN_EMAIL:-marcelo.augsd@gmail.com}"
@@ -61,6 +62,16 @@ sudo install -m 0600 "$TMP/agent-token" /etc/sentinela/agent-token
 sed -e "s|https://sentinela.exemplo.com|${API_BASE}|" \
     -e "s|^#Environment=SENTINELA_LOGS=.*|${AGENT_LOGS:+Environment=SENTINELA_LOGS=${AGENT_LOGS}}|" "$ROOT/deploy/sentinela-agent.service" \
   | sudo tee /etc/systemd/system/sentinela-agent.service >/dev/null
+if [ -d /etc/polkit-1/rules.d ]; then # permite ao agente iniciar/parar/reiniciar só as unidades do catálogo
+  sudo install -m 0644 "$ROOT/deploy/50-sentinela-agent.rules" /etc/polkit-1/rules.d/50-sentinela-agent.rules
+else
+  echo "aviso: polkit não encontrado; o painel não conseguirá iniciar/parar/reiniciar serviços (apt install polkitd)"
+fi
+if [ "${AGENT_DOCKER:-}" = yes ] && getent group docker >/dev/null; then
+  sudo install -d -m 0755 /etc/systemd/system/sentinela-agent.service.d
+  printf '[Service]\nSupplementaryGroups=docker\n' | sudo tee /etc/systemd/system/sentinela-agent.service.d/docker.conf >/dev/null
+  echo "Agente com acesso ao Docker (grupo docker)."
+fi
 sudo systemctl daemon-reload
 sudo systemctl enable --now sentinela-agent
 sleep 3

@@ -4,6 +4,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"sentinela/internal/metrics"
 )
 
 func env(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
@@ -52,5 +54,25 @@ func TestTokenFromFileAndInsecureOverride(t *testing.T) {
 func TestClampInterval(t *testing.T) {
 	if clampInterval(time.Second) != minInterval || clampInterval(time.Hour) != maxInterval || clampInterval(20*time.Second) != 20*time.Second {
 		t.Error("clampInterval incorreto")
+	}
+}
+
+func TestIsHot(t *testing.T) {
+	pct := func(v float64) *float64 { return &v }
+	cases := []struct {
+		name string
+		p    metrics.Payload
+		want bool
+	}{
+		{"ocioso", metrics.Payload{CPU: metrics.CPU{UsagePercent: pct(10)}, Memory: metrics.Memory{TotalBytes: 1000, UsedBytes: 300}}, false},
+		{"cpu alta", metrics.Payload{CPU: metrics.CPU{UsagePercent: pct(91)}, Memory: metrics.Memory{TotalBytes: 1000, UsedBytes: 300}}, true},
+		{"cpu no limite", metrics.Payload{CPU: metrics.CPU{UsagePercent: pct(85)}}, true},
+		{"memória alta", metrics.Payload{CPU: metrics.CPU{UsagePercent: pct(5)}, Memory: metrics.Memory{TotalBytes: 1000, UsedBytes: 900}}, true},
+		{"sem cpu medida e sem memória", metrics.Payload{}, false},
+	}
+	for _, c := range cases {
+		if got := isHot(c.p); got != c.want {
+			t.Errorf("%s: %v", c.name, got)
+		}
 	}
 }

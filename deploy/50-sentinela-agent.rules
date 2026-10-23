@@ -1,0 +1,31 @@
+// /etc/polkit-1/rules.d/50-sentinela-agent.rules
+// Permite que o agente do Sentinela (usuário dinâmico "sentinela-agent", sem privilégios) inicie, pare e reinicie
+// SOMENTE as unidades abaixo — as mesmas do catálogo de descoberta (internal/discovery). Qualquer outra
+// unidade ou verbo (enable, mask, kill, daemon-reload...) continua negada. Mantenha esta lista igual à do catálogo.
+polkit.addRule(function (action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units" || subject.user !== "sentinela-agent") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var verb = action.lookup("verb");
+    if (verb !== "start" && verb !== "stop" && verb !== "restart") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var unit = action.lookup("unit") || "";
+    var allowed = [
+        /^ssh\.service$/, /^sshd\.service$/,
+        /^cron\.service$/, /^crond\.service$/,
+        /^systemd-timesyncd\.service$/,
+        /^rsyslog\.service$/,
+        /^nginx\.service$/,
+        /^redis-server\.service$/, /^redis\.service$/, /^redis@[A-Za-z0-9:_.-]+\.service$/,
+        /^docker\.service$/,
+        /^postgresql\.service$/, /^postgresql@[A-Za-z0-9:_.-]+\.service$/
+    ];
+    for (var i = 0; i < allowed.length; i++) {
+        if (allowed[i].test(unit)) {
+            polkit.log("sentinela-agent: " + verb + " " + unit);
+            return polkit.Result.YES;
+        }
+    }
+    return polkit.Result.NOT_HANDLED;
+});

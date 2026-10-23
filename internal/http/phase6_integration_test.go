@@ -355,7 +355,7 @@ func TestAuthorizationMatrixCoversEveryRoute(t *testing.T) {
 		}
 	}
 	t.Logf("matriz: %d rotas; verificações %v", len(routes), checked)
-	if checked["negado"] < 35 || checked["permitido"] < 90 || checked["agent"] != 6 {
+	if checked["negado"] < 35 || checked["permitido"] < 90 || checked["agent"] != 10 {
 		t.Errorf("cobertura da matriz: %v", checked)
 	}
 

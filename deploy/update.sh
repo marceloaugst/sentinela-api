@@ -5,6 +5,8 @@
 #   sudo ./deploy/update.sh --dry-run        # só mostra o que faria
 #   sudo ./deploy/update.sh --no-agent       # só a API/ClickHouse
 #   sudo ./deploy/update.sh --logs nginx,ufw # escolhe as fontes de log (padrão: as que existem; "none" desliga)
+#   sudo ./deploy/update.sh --docker         # deixa o agente listar/iniciar/reiniciar containers (dá acesso ao socket do Docker: equivale a root!)
+#   sudo ./deploy/update.sh --no-docker      # remove esse acesso
 #
 # Ordem (pensada para ter volta):
 #   1. checagens  2. backup (banco, código atual, binário e unit do agente)  3. copia o código novo (preserva o .env)
@@ -20,14 +22,17 @@ BACKUP_ROOT="${BACKUP_ROOT:-/root/backups}"
 UNIT=/etc/systemd/system/sentinela-agent.service
 AGENT_BIN=/usr/local/bin/sentinela-agent
 
-DRY_RUN=0; NO_AGENT=0; NO_BACKUP=0; LOGS=""; LOGS_SET=0
+DOCKER_DROPIN=/etc/systemd/system/sentinela-agent.service.d/docker.conf
+DRY_RUN=0; NO_AGENT=0; NO_BACKUP=0; LOGS=""; LOGS_SET=0; DOCKER_MODE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift;;
     --no-agent) NO_AGENT=1; shift;;
     --skip-backup) NO_BACKUP=1; shift;;
     --logs) LOGS="${2?}"; LOGS_SET=1; shift 2;;
-    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    --docker) DOCKER_MODE=on; shift;;
+    --no-docker) DOCKER_MODE=off; shift;;
+    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     *) echo "opção desconhecida: $1" >&2; exit 2;;
   esac
 done
@@ -82,6 +87,7 @@ else
   tar -C "$APP_DIR" --exclude=bin -czf "$BK/app-before.tgz" . && ok "código atual salvo (app-before.tgz, inclui .env: proteja)"
   if [ -f "$UNIT" ]; then cp -p "$UNIT" "$BK/sentinela-agent.service" && ok "unit do agente salvo"; fi
   if [ -f "$AGENT_BIN" ]; then cp -p "$AGENT_BIN" "$BK/sentinela-agent" && ok "binário do agente salvo"; fi
+  if [ -f "$DOCKER_DROPIN" ]; then cp -p "$DOCKER_DROPIN" "$BK/docker.conf"; fi
 fi
 
 # ---------------------------------------------------------------- 3. código novo
@@ -131,13 +137,14 @@ rollback_agent() {
   warn "restaurando o agente anterior"
   if [ -f "$BK/sentinela-agent" ]; then install -m 0755 "$BK/sentinela-agent" "$AGENT_BIN"; fi
   if [ -f "$BK/sentinela-agent.service" ]; then install -m 0644 "$BK/sentinela-agent.service" "$UNIT"; fi
+  if [ -f "$BK/docker.conf" ]; then install -m 0644 "$BK/docker.conf" "$DOCKER_DROPIN"; else rm -f "$DOCKER_DROPIN"; fi
   systemctl daemon-reload; systemctl restart sentinela-agent || true
 }
 step "5/6 Agente"
 if [ "$AGENT_OK" = 0 ]; then
   echo "  (pulado)"
 elif [ "$DRY_RUN" = 1 ]; then
-  echo "  [dry-run] compilaria o agente, manteria a URL atual do unit, aplicaria o unit novo (grupo adm, StateDirectory, SENTINELA_LOGS=${LOGS:-nenhum}) e reiniciaria"
+  echo "  [dry-run] compilaria o agente, manteria a URL atual do unit, aplicaria o unit novo (grupo adm, StateDirectory, SENTINELA_LOGS=${LOGS:-nenhum}), instalaria a regra polkit dos comandos de serviço${DOCKER_MODE:+ (docker: $DOCKER_MODE)} e reiniciaria"
 else
   API_URL="$(sed -n 's/^Environment=SENTINELA_API_URL=\(.*\)$/\1/p' "$UNIT" | head -1 || true)"
   [ -n "$API_URL" ] || die "não achei SENTINELA_API_URL em $UNIT (API já atualizada; o agente não foi alterado)"
@@ -149,6 +156,27 @@ else
       "$REPO/deploy/sentinela-agent.service" > "$TMP/unit"
   install -m 0755 "$TMP/sentinela-agent" "$AGENT_BIN.new" && mv -f "$AGENT_BIN.new" "$AGENT_BIN"
   install -m 0644 "$TMP/unit" "$UNIT"
+  # polkit: deixa o agente (sem privilégios) iniciar/parar/reiniciar só as unidades do catálogo, a pedido do painel
+  if [ -d /etc/polkit-1/rules.d ]; then
+    install -m 0644 "$REPO/deploy/50-sentinela-agent.rules" /etc/polkit-1/rules.d/50-sentinela-agent.rules && ok "regra polkit instalada (iniciar/parar/reiniciar serviços)"
+  else
+    warn "polkit não encontrado: o painel não conseguirá iniciar/parar/reiniciar serviços (apt install polkitd)"
+  fi
+  # Docker (opcional): o grupo "docker" dá ao agente acesso ao socket do daemon, o que equivale a root no servidor.
+  # Sem --docker/--no-docker, mantém o que já estava configurado.
+  if [ "$DOCKER_MODE" = on ]; then
+    if getent group docker >/dev/null; then
+      install -d -m 0755 "$(dirname "$DOCKER_DROPIN")"
+      printf '[Service]\nSupplementaryGroups=docker\n' > "$DOCKER_DROPIN"
+      ok "agente com acesso ao Docker (grupo docker). Atenção: quem controla o agente controla o servidor"
+    else
+      warn "grupo docker não existe: o Docker não está instalado aqui; nada a fazer"
+    fi
+  elif [ "$DOCKER_MODE" = off ]; then
+    rm -f "$DOCKER_DROPIN"; ok "acesso do agente ao Docker removido"
+  elif [ -f "$DOCKER_DROPIN" ]; then
+    ok "acesso ao Docker mantido ($DOCKER_DROPIN)"
+  fi
   systemctl daemon-reload
   systemctl restart sentinela-agent
   sleep 6

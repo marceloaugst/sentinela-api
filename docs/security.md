@@ -26,7 +26,7 @@ Resumo do modelo de ameaças, das decisões e dos controles. O que está aqui co
 | Papel | Pode |
 |---|---|
 | `viewer` | Ler: servidores, métricas, dashboard, serviços, regras, alertas, incidentes, eventos (SSE). |
-| `operator` | Tudo do viewer + reconhecer/resolver alertas, executar verificação de serviço, **criar/alterar/remover serviços e regras de alerta**. |
+| `operator` | Tudo do viewer + reconhecer/resolver alertas, executar verificação de serviço, **iniciar/parar/reiniciar serviços** (via agente, auditado), **criar/alterar/remover serviços e regras de alerta**. |
 | `admin` | Tudo + servidores, **credenciais de agente**, **canais de notificação**, **usuários**, **auditoria**. |
 
 - Canais de notificação e credenciais ficam só com `admin` (contêm destinos e segredos).
@@ -60,11 +60,14 @@ HTTPS é terminado no Nginx (a API escuta em `127.0.0.1`). Respostas levam `X-Co
 
 ## 6. Agente e injeção
 - A API **não faz requisições a alvos informados por usuários** (não há mais verificação `http` nem cadastro de serviços), então não há superfície de SSRF.
-- O agente não executa comandos nem abre conexões a pedido da API: a descoberta só lê `/proc`, cgroup e arquivos de unit. O texto "o que fazer" é gerado pela API a partir de um vocabulário fechado.
+- O agente não abre conexões a pedido da API e não executa comandos arbitrários: a descoberta só lê `/proc`, cgroup e arquivos de unit. O texto "o que fazer" é gerado pela API a partir de um vocabulário fechado.
+- **Única exceção — comandos de serviço** (`start|stop|restart`, papel `operator`): a API só envia `(chave do catálogo, ação)`; o agente resolve a unidade sozinha, valida contra o catálogo e roda `systemctl` sem shell. O agente **não roda como root**: a autorização é uma regra polkit restrita ao usuário `sentinela-agent`, a esses três verbos e às unidades do catálogo (`deploy/50-sentinela-agent.rules`). Um token de agente vazado **não** consegue iniciar comandos (só recebe os pendentes do próprio servidor); uma API comprometida só alcança as unidades da lista. Cada pedido grava quem (usuário, e-mail, IP) em `service_commands` e em `audit_logs` (`service.start|stop|restart`, resultado em `service.result`). O SSH não pode ser parado; `journald` e `ufw` não têm ação; containers Docker têm fluxo à parte (abaixo).
+- **Processos**: o agente envia o retrato dos processos (nome, usuário, CPU, memória e linha de comando com segredos aparentes mascarados, heurística). A linha de comando é gravada no PostgreSQL e visível a qualquer `viewer`; o histórico no ClickHouse (5 maiores por CPU e por memória a cada leitura) guarda só nome, usuário, pid, CPU e memória, **sem** linha de comando. Alertas de CPU/memória citam o nome dos maiores consumidores na mensagem e nas notificações (Telegram e outros canais). **Encerrar** (`process.terminate|kill`, `operator`) só alcança processos do mesmo usuário do agente: a API manda `(pid, início, ação)`, o agente reconfere tudo com um pidfd aberto antes (não atinge pid reaproveitado) e recusa pid 1, o próprio agente, processos do sistema, de serviços do catálogo, de containers e de outros usuários. Sem root, sem polkit e sem capabilities extras: o limite é o do usuário do agente.
+- **Containers Docker (opcional)**: o acesso do agente ao socket do Docker é desligado por padrão e só existe depois de `update.sh --docker` (grupo `docker`, o que **equivale a root** no servidor). A API envia apenas `(id completo do container, start|restart)`; o agente confere o id e o estado contra a própria listagem e usa só as chamadas `list`, `inspect`, `logs`, `start` e `restart` do daemon. Quem pediu fica em `service_commands` e na auditoria (`docker.start|restart`, resultado em `service.result`). O fim do log dos containers inativos (`log_tail`) é gravado no PostgreSQL e pode conter dados sensíveis da aplicação.
 - SQL: somente consultas parametrizadas; ordenações por lista permitida.
 
 ## 7. Auditoria
-`GET /api/v1/audit-logs` (admin): quem (`actor`, `actor_user_id`), o quê, em qual recurso, de qual IP e quando — login e bloqueios, usuários, servidores, credenciais, serviços, regras, canais, reconhecimento/resolução de alertas. Retenção `AUDIT_RETENTION_DAYS` (365). Não há tela de "configurações" mutável: a configuração é por variáveis de ambiente (alterá-las exige redeploy e fica no controle de versão do operador).
+`GET /api/v1/audit-logs` (admin): quem (`actor`, `actor_user_id`), o quê, em qual recurso, de qual IP e quando — login e bloqueios, usuários, servidores, credenciais, serviços, regras, canais, reconhecimento/resolução de alertas e comandos de serviço (`service.start|stop|restart` com quem pediu; `service.result` com o desfecho do agente). Retenção `AUDIT_RETENTION_DAYS` (365). Não há tela de "configurações" mutável: a configuração é por variáveis de ambiente (alterá-las exige redeploy e fica no controle de versão do operador).
 
 ## 8. Limitações conhecidas (e o que fazer)
 | Limitação | Mitigação / próximo passo |

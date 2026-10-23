@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"sentinela/internal/logstore"
+	"sentinela/internal/procs"
 	"sentinela/internal/sysmetrics"
 	"sentinela/internal/telemetry"
 )
@@ -23,6 +24,7 @@ type Evaluator struct {
 	HeartbeatTimeout time.Duration
 	Metrics          *telemetry.Metrics // opcional
 	System           SystemSource       // opcional: métricas de sistema no ClickHouse
+	Procs            ProcSource         // opcional: histórico dos maiores consumidores (ClickHouse)
 	Now              func() time.Time
 }
 
@@ -62,6 +64,13 @@ type serviceSnap struct {
 type SystemSource interface {
 	Ready() bool
 	LatestSystem(ctx context.Context, window time.Duration) ([]logstore.SystemValue, error)
+}
+
+// ProcSource fornece o histórico dos maiores consumidores (ClickHouse) para apontar o culpado de um alerta de
+// CPU/memória. Sem ele (ou sem dados), o alerta usa a última leitura de processos guardada no PostgreSQL.
+type ProcSource interface {
+	Ready() bool
+	ProcCulprits(ctx context.Context, serverID string, from, to time.Time, kind string, n int) ([]procs.Culprit, int, error)
 }
 
 const systemWindow = 10 * time.Minute
@@ -434,6 +443,7 @@ func (e *Evaluator) apply(ctx context.Context, tx pgx.Tx, rule Rule, t Target, c
 		return err
 	case ActFire:
 		e.count("fire")
+		t.Culprits = e.culprits(ctx, rule, t, now)
 		return fire(ctx, tx, rule, t, existing, now)
 	case ActClearRecovering:
 		_, err := tx.Exec(ctx, `UPDATE alerts SET recovering_since = NULL, value = $2, last_evaluated_at = $3 WHERE id = $1`, cur.ID, t.Value, now)
@@ -482,4 +492,52 @@ func (e *Evaluator) resolveOrphans(ctx context.Context, now time.Time) error {
 		e.count("resolve")
 	}
 	return tx.Commit(ctx)
+}
+
+// culpritKind diz qual consumo explica o alerta (vazio = a regra não tem relação com processos).
+func culpritKind(metric string) string {
+	switch metric {
+	case MetricCPU, MetricLoad, MetricLoadPerCPU:
+		return procs.KindCPU
+	case MetricMemory, MetricSwap, MetricOOM:
+		return procs.KindMemory
+	}
+	return ""
+}
+
+const (
+	culpritCount     = 3
+	minCulpritWindow = 2 * time.Minute
+	maxCulpritWindow = 15 * time.Minute
+	snapshotMaxAge   = 2 * time.Minute
+)
+
+// culprits aponta os maiores consumidores de CPU/memória do servidor. Primeiro o histórico da janela em que a condição
+// vinha valendo (média por nome de processo); sem histórico, a última leitura de processos, se for recente. Nunca falha o
+// alerta: sem dados, o alerta sai sem a lista.
+func (e *Evaluator) culprits(ctx context.Context, rule Rule, t Target, now time.Time) *procs.Culprits {
+	kind := culpritKind(rule.MetricName)
+	if kind == "" || t.ServiceID != nil {
+		return nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	window := time.Duration(rule.DurationSeconds) * time.Second
+	window = min(max(window, minCulpritWindow), maxCulpritWindow)
+	if e.Procs != nil && e.Procs.Ready() {
+		list, samples, err := e.Procs.ProcCulprits(cctx, t.ServerID, now.Add(-window), now, kind, culpritCount)
+		switch {
+		case err != nil:
+			e.Log.Debug("histórico de processos indisponível para o alerta", "err", err, "server_id", t.ServerID)
+		case samples > 0 && len(list) > 0:
+			return &procs.Culprits{Kind: kind, Source: "history", WindowSeconds: int(window.Seconds()), At: now, Processes: list}
+		}
+	}
+	rep, err := procs.NewRepository(e.Pool).Get(cctx, t.ServerID)
+	if err != nil || rep == nil || now.Sub(rep.CheckedAt) > snapshotMaxAge {
+		return nil
+	}
+	c := procs.CulpritsFromSnapshot(*rep, kind, culpritCount)
+	return &c
 }

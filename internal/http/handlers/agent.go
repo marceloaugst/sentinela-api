@@ -8,10 +8,13 @@ import (
 
 	"sentinela/internal/agents"
 	"sentinela/internal/discovery"
+	"sentinela/internal/dockerhost"
 	"sentinela/internal/events"
 	"sentinela/internal/http/response"
 	"sentinela/internal/metrics"
+	"sentinela/internal/procs"
 	"sentinela/internal/services"
+	"sentinela/internal/svcactions"
 )
 
 // MaxAgentBodyBytes limita o corpo das requisições de agentes.
@@ -21,6 +24,10 @@ type Agent struct {
 	Metrics          *metrics.Repository
 	Services         *services.Repository
 	Discovery        *discovery.Repository
+	Docker           *dockerhost.Repository
+	Procs            *procs.Repository
+	ProcHistory      ProcHistoryStore // nil = sem ClickHouse
+	SvcCommands      *svcactions.Repository
 	Log              *slog.Logger
 	CollectInterval  time.Duration
 	HeartbeatTimeout time.Duration

@@ -4,6 +4,7 @@ package alerts_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -18,6 +19,7 @@ import (
 	"sentinela/internal/audit"
 	"sentinela/internal/incidents"
 	"sentinela/internal/logstore"
+	"sentinela/internal/procs"
 	"sentinela/internal/testutil"
 )
 
@@ -827,5 +829,101 @@ func TestEveryAlertIsRecordedAsNotification(t *testing.T) {
 	f.tick() // recuperação
 	if n := f.count(`SELECT count(*) FROM notifications WHERE kind='alert_resolved' AND priority=4 AND severity='info' AND title LIKE 'Recuperado:%'`); n != 2 {
 		t.Errorf("recuperações registradas (P4): %d", n)
+	}
+}
+
+type fakeProcs struct {
+	ready   bool
+	err     error
+	list    []procs.Culprit
+	samples int
+	kinds   []string
+}
+
+func (p *fakeProcs) Ready() bool { return p.ready }
+func (p *fakeProcs) ProcCulprits(_ context.Context, _ string, _, _ time.Time, kind string, _ int) ([]procs.Culprit, int, error) {
+	p.kinds = append(p.kinds, kind)
+	return p.list, p.samples, p.err
+}
+
+// O alerta de CPU/memória aponta os maiores consumidores: do histórico quando existe, da última leitura quando não.
+func TestAlertNamesTheProcessesBehindCPUAndMemory(t *testing.T) {
+	f := newFx(t)
+	f.pool.Exec(ctx, `DELETE FROM alert_rules`)
+	if err := alerts.SyncCatalog(ctx, f.pool); err != nil {
+		t.Fatal(err)
+	}
+	srv := f.server("web")
+	hist := &fakeProcs{ready: true, samples: 10, list: []procs.Culprit{
+		{Name: "node", User: "app", CPUPercent: 85.5, CPUPeak: 100, MemoryBytes: 400 << 20},
+		{Name: "backup", User: "root", CPUPercent: 7, CPUPeak: 60, MemoryBytes: 10 << 20}}}
+	f.ev.Procs = hist
+	cpuHigh := func() {
+		f.beat(srv, 96)
+		f.tick()
+		f.advance(6 * time.Minute) // acima da duração de 5 min
+		f.beat(srv, 96)
+		f.tick()
+	}
+	cpuHigh()
+	msg := f.str(`SELECT a.message FROM alerts a JOIN alert_rules r ON r.id=a.rule_id WHERE r.code='cpu_high'`)
+	if !strings.Contains(msg, "Uso de CPU em 96.0%") || !strings.Contains(msg, "Maiores consumidores de CPU (média dos últimos 5 min): node 85.5% de CPU, backup 7.0% de CPU.") {
+		t.Fatalf("mensagem: %q", msg)
+	}
+	if len(hist.kinds) == 0 || hist.kinds[0] != "cpu" {
+		t.Errorf("tipo consultado: %v", hist.kinds)
+	}
+	raw := f.str(`SELECT a.culprits::text FROM alerts a JOIN alert_rules r ON r.id=a.rule_id WHERE r.code='cpu_high'`)
+	var c procs.Culprits
+	if err := json.Unmarshal([]byte(raw), &c); err != nil || c.Source != "history" || c.Kind != "cpu" || len(c.Processes) != 2 || c.Processes[0].Name != "node" || c.WindowSeconds != 300 {
+		t.Errorf("culprits gravado: %s %v", raw, err)
+	}
+	// a API devolve o campo no alerta e no incidente
+	list, _, err := f.repo.ListAlerts(ctx, alerts.AlertListParams{Page: 1, PerPage: 50})
+	if err != nil || len(list) == 0 || !strings.Contains(string(list[0].Culprits), `"node"`) {
+		t.Errorf("culprits na API: %v %v", list, err)
+	}
+	var incID string
+	if err := f.pool.QueryRow(ctx, `SELECT incident_id::text FROM alerts LIMIT 1`).Scan(&incID); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := f.inc.Get(ctx, incID); err != nil || len(d.Alerts) != 1 || !strings.Contains(string(d.Alerts[0].Culprits), `"node"`) {
+		t.Errorf("culprits no incidente: %+v %v", d, err)
+	}
+	if n := f.count(`SELECT count(*) FROM notifications WHERE message LIKE '%node 85.5%'`); n == 0 {
+		t.Error("a notificação deve trazer os consumidores")
+	}
+
+	// Sem histórico: usa a última leitura de processos (se for recente) para a regra de memória.
+	f.ev.Procs = &fakeProcs{ready: true, samples: 0}
+	rep := procs.Report{CheckedAt: f.now, CPUs: 4, MemoryTotalBytes: 1 << 30, Processes: []procs.Process{
+		{PID: 1, Name: "java", User: "app", State: "S", MemoryBytes: 700 << 20},
+		{PID: 2, Name: "redis", User: "redis", State: "S", MemoryBytes: 100 << 20}}}
+	if err := procs.NewRepository(f.pool).Replace(ctx, srv, rep); err != nil {
+		t.Fatal(err)
+	}
+	f.pool.Exec(ctx, `UPDATE server_metrics SET memory_used_bytes = 950`)
+	f.advance(time.Minute)
+	f.exec(`INSERT INTO server_metrics (server_id, collected_at, cpu_usage_percent, cpu_count, load_average_1m, memory_total_bytes, memory_used_bytes, memory_available_bytes)
+		VALUES ($1,$2,10,4,0.5,1000,950,50)`, srv, f.now)
+	f.exec(`UPDATE servers SET last_seen_at = $2 WHERE id = $1`, srv, f.now)
+	f.tick()
+	f.advance(3 * time.Minute) // acima da duração de 2 min
+	f.exec(`INSERT INTO server_metrics (server_id, collected_at, cpu_usage_percent, cpu_count, load_average_1m, memory_total_bytes, memory_used_bytes, memory_available_bytes)
+		VALUES ($1,$2,10,4,0.5,1000,950,50)`, srv, f.now)
+	f.exec(`UPDATE servers SET last_seen_at = $2 WHERE id = $1`, srv, f.now)
+	rep.CheckedAt = f.now.Add(-20 * time.Second)
+	if err := procs.NewRepository(f.pool).Replace(ctx, srv, rep); err != nil {
+		t.Fatal(err)
+	}
+	f.tick()
+	msg = f.str(`SELECT a.message FROM alerts a JOIN alert_rules r ON r.id=a.rule_id WHERE r.code='memory_low'`)
+	if !strings.Contains(msg, "Maiores consumidores de memória (na última leitura): java 700 MB, redis 100 MB.") {
+		t.Errorf("fallback para a última leitura: %q", msg)
+	}
+
+	// Regras sem relação com processos (disco) não consultam nem anexam nada.
+	if k := len(hist.kinds); k == 0 {
+		t.Error("o histórico deveria ter sido consultado")
 	}
 }

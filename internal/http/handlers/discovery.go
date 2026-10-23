@@ -8,6 +8,7 @@ import (
 	"sentinela/internal/discovery"
 	"sentinela/internal/http/response"
 	"sentinela/internal/servers"
+	"sentinela/internal/svcactions"
 )
 
 type Discovery struct {
@@ -37,6 +38,13 @@ func (h Discovery) ListByServer(w http.ResponseWriter, r *http.Request) {
 		h.Log.Error("falha ao listar descoberta de serviços", "err", err, "server_id", id)
 		response.Internal(w)
 		return
+	}
+	for i := range items {
+		it := &items[i]
+		it.Actions = svcactions.Allowed(it.Key, it.Status, it.Source, it.Unit)
+		if it.Actions == nil {
+			it.Actions = []string{}
+		}
 	}
 	response.JSON(w, http.StatusOK, map[string]any{
 		"summary":    discovery.Summarize(items),

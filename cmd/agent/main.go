@@ -1,5 +1,8 @@
 // Agente do Sentinela: coleta métricas locais e as envia à API central.
-// Não executa comandos recebidos da API; apenas lê /proc e statfs e faz requisições de saída.
+// Só faz requisições de saída. A única coisa que executa a pedido da API são os comandos de serviço
+// (iniciar, parar, reiniciar), restritos a `systemctl` sobre as unidades do catálogo (veja o pacote svcctl),
+// e iniciar/reiniciar containers Docker pelo socket, se o agente tiver acesso a ele (pacote dockerhost), e encerrar
+// processos do MESMO usuário do agente (pacote procs).
 package main
 
 import (
@@ -21,8 +24,12 @@ import (
 	"sentinela/internal/agentclient"
 	"sentinela/internal/collector"
 	"sentinela/internal/discovery"
+	"sentinela/internal/dockerhost"
 	"sentinela/internal/logtail"
 	"sentinela/internal/metrics"
+	"sentinela/internal/procs"
+	"sentinela/internal/svcactions"
+	"sentinela/internal/svcctl"
 	"sentinela/internal/sysmetrics"
 )
 
@@ -130,9 +137,15 @@ func run(log *slog.Logger) error {
 		log.Warn("heartbeat inicial falhou; seguindo", "err", err)
 	}
 	disc := newDiscoveryRunner(log, client)
+	dock := newDockerRunner(log, client)
 	sys := newSystemRunner(log, client)
+	scanner := procs.NewScanner()
+	scanner.Scan(time.Now()) // amostra-base do CPU% dos processos
+	prc := newProcessRunner(log, client, scanner)
 	logsDone := startLogShipper(ctx, log, cfg)
 	defer func() { stop(); <-logsDone }() // garante que a posição dos logs foi gravada antes de sair
+	cmdsDone := startCommandRunner(ctx, log, cfg, scanner)
+	defer func() { stop(); <-cmdsDone }()
 	if remote := fetchCollectInterval(ctx, log, client); cfg.interval == 0 && remote > 0 {
 		interval = clampInterval(time.Duration(remote) * time.Second)
 	}
@@ -147,9 +160,11 @@ func run(log *slog.Logger) error {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
-		collectAndSend(ctx, log, col, client, interval)
+		hot := collectAndSend(ctx, log, col, client, interval)
 		disc.runDue(ctx)
+		dock.runDue(ctx)
 		sys.runDue(ctx)
+		prc.runDue(ctx, hot)
 		select {
 		case <-ctx.Done():
 			log.Info("agente encerrando")
@@ -196,7 +211,9 @@ func logRejection(log *slog.Logger, err error) {
 	}
 }
 
-func collectAndSend(ctx context.Context, log *slog.Logger, col *collector.Collector, client *agentclient.Client, interval time.Duration) {
+// collectAndSend coleta e envia as métricas. Devolve true se CPU ou memória estão acima de hotPercent: o laço principal
+// então envia também os processos na hora, para o alerta e o histórico saberem quem estava consumindo.
+func collectAndSend(ctx context.Context, log *slog.Logger, col *collector.Collector, client *agentclient.Client, interval time.Duration) bool {
 	// O envio inteiro (com retentativas) não pode ultrapassar o intervalo: evita acúmulo.
 	sctx, cancel := context.WithTimeout(ctx, interval)
 	defer cancel()
@@ -206,7 +223,7 @@ func collectAndSend(ctx context.Context, log *slog.Logger, col *collector.Collec
 	ccancel()
 	if err != nil {
 		log.Warn("coleta descartada", "err", err)
-		return
+		return false
 	}
 	var res struct {
 		Stored    bool `json:"stored"`
@@ -215,9 +232,20 @@ func collectAndSend(ctx context.Context, log *slog.Logger, col *collector.Collec
 	if err := client.Do(sctx, "POST", "/api/v1/agent/metrics", p, &res); err != nil {
 		logRejection(log, err)
 		log.Warn("envio de métricas falhou; amostra descartada", "err", err)
-		return
+		return isHot(p)
 	}
 	log.Debug("métricas enviadas", "stored", res.Stored)
+	return isHot(p)
+}
+
+// hotPercent é o uso de CPU ou memória a partir do qual os processos passam a ser enviados a cada coleta.
+const hotPercent = 85.0
+
+func isHot(p metrics.Payload) bool {
+	if p.CPU.UsagePercent != nil && *p.CPU.UsagePercent >= hotPercent {
+		return true
+	}
+	return p.Memory.TotalBytes > 0 && float64(p.Memory.UsedBytes)/float64(p.Memory.TotalBytes)*100 >= hotPercent
 }
 
 // fetchCollectInterval busca em /agent/config o intervalo de coleta sugerido pela API (0 se indisponível).
@@ -279,6 +307,59 @@ func (r *discoveryRunner) runDue(ctx context.Context) {
 	r.lastKey, r.lastSent = key, now
 }
 
+// dockerRunner detecta o Docker do host e lista os containers (com o erro e o fim do log dos que não estão ativos).
+// O retrato vai a /agent/docker quando algo muda — ou, no mínimo, a cada dockerResend. Sem Docker, o agente
+// informa isso uma vez (not_installed) e continua verificando a cada minuto, caso ele seja instalado depois.
+type dockerRunner struct {
+	log       *slog.Logger
+	client    *agentclient.Client
+	docker    *dockerhost.Client
+	lastCheck time.Time
+	lastSent  time.Time
+	lastKey   string
+}
+
+const (
+	dockerEvery  = time.Minute
+	dockerResend = 5 * time.Minute
+)
+
+func newDockerRunner(log *slog.Logger, c *agentclient.Client) *dockerRunner {
+	return &dockerRunner{log: log, client: c, docker: dockerhost.NewClient(os.Getenv("SENTINELA_DOCKER_SOCKET"))}
+}
+
+func (r *dockerRunner) runDue(ctx context.Context) {
+	now := time.Now()
+	if now.Sub(r.lastCheck) < dockerEvery {
+		return
+	}
+	r.lastCheck = now
+	dctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	rep := r.docker.Snapshot(dctx, now)
+	cancel()
+	var sb strings.Builder
+	sb.WriteString(rep.Status + "|" + rep.Message + ";")
+	for _, c := range rep.Containers {
+		code := ""
+		if c.ExitCode != nil {
+			code = strconv.Itoa(*c.ExitCode)
+		}
+		sb.WriteString(c.ID + "|" + c.State + "|" + code + "|" + c.Error + "|" + c.LogTail + ";")
+	}
+	key := sb.String()
+	if key == r.lastKey && now.Sub(r.lastSent) < dockerResend {
+		return
+	}
+	sctx, scancel := context.WithTimeout(ctx, 15*time.Second)
+	defer scancel()
+	if err := r.client.Do(sctx, "POST", "/api/v1/agent/docker", rep, nil); err != nil {
+		logRejection(r.log, err)
+		r.log.Warn("envio do retrato do Docker falhou", "err", err)
+		return
+	}
+	r.lastKey, r.lastSent = key, now
+}
+
 // systemRunner coleta a cada minuto as métricas de sistema (OOM Killer, inodes, latência de disco, NTP,
 // atualizações de segurança, certificados) e as envia a /agent/system-metrics, que as grava no ClickHouse.
 // Sem ClickHouse (503) ou com falha de rede, a amostra é descartada: a próxima rodada traz dados novos.
@@ -318,4 +399,116 @@ func (r *systemRunner) runDue(ctx context.Context) {
 		return
 	}
 	r.log.Debug("métricas de sistema enviadas", "samples", len(samples))
+}
+
+// processRunner envia a cada processEvery o retrato dos processos (CPU% e memória) a /agent/processes. O CPU% é a
+// diferença entre duas leituras do /proc, por isso o Scanner é compartilhado com o executor de comandos.
+type processRunner struct {
+	log     *slog.Logger
+	client  *agentclient.Client
+	scanner *procs.Scanner
+	lastRun time.Time
+}
+
+const (
+	processEvery    = 30 * time.Second
+	processHotEvery = 10 * time.Second
+)
+
+func newProcessRunner(log *slog.Logger, c *agentclient.Client, sc *procs.Scanner) *processRunner {
+	return &processRunner{log: log, client: c, scanner: sc}
+}
+
+// runDue envia o retrato se passou processEvery — ou, com o servidor "quente" (CPU/memória altas), se passou
+// processHotEvery, para registrar quem estava consumindo durante o pico.
+func (r *processRunner) runDue(ctx context.Context, hot bool) {
+	now := time.Now()
+	every := processEvery
+	if hot {
+		every = processHotEvery
+	}
+	if now.Sub(r.lastRun) < every {
+		return
+	}
+	r.lastRun = now
+	rep := r.scanner.Scan(now)
+	sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	if err := r.client.Do(sctx, "POST", "/api/v1/agent/processes", rep, nil); err != nil {
+		logRejection(r.log, err)
+		r.log.Warn("envio dos processos falhou; amostra descartada", "err", err)
+		return
+	}
+	r.log.Debug("processos enviados", "listed", len(rep.Processes), "total", rep.Total)
+}
+
+// commandEvery é o intervalo da busca de comandos de serviço: curto, para o botão responder rápido.
+// São 12 requisições por minuto, bem abaixo do limite de 2/s por credencial.
+const commandEvery = 5 * time.Second
+
+// startCommandRunner busca na API os comandos de serviço pendentes (iniciar, parar, reiniciar), executa
+// e devolve o resultado. Depois de cada comando reenvia a descoberta, para a tela refletir o novo estado.
+// O canal devolvido é fechado quando o laço termina.
+func startCommandRunner(ctx context.Context, log *slog.Logger, cfg settings, scanner *procs.Scanner) <-chan struct{} {
+	done := make(chan struct{})
+	client := agentclient.New(cfg.apiURL, cfg.token, "sentinela-agent/"+version)
+	client.MaxAttempts = 2
+	exec := svcctl.New(scanner)
+	disc := newDiscoveryRunner(log, client)
+	dock := newDockerRunner(log, client)
+	go func() {
+		defer close(done)
+		t := time.NewTicker(commandEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			var pending []svcactions.Pending
+			pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := client.Do(pctx, "GET", "/api/v1/agent/commands", nil, &pending)
+			cancel()
+			if err != nil {
+				if ctx.Err() == nil {
+					logRejection(log, err)
+					log.Debug("busca de comandos falhou", "err", err)
+				}
+				continue
+			}
+			for _, c := range pending {
+				runCommand(ctx, log, client, exec, c)
+				// força o reenvio da descoberta e do retrato do Docker, para a tela refletir o novo estado
+				disc.lastCheck, disc.lastKey = time.Time{}, ""
+				disc.runDue(ctx)
+				dock.lastCheck, dock.lastKey = time.Time{}, ""
+				dock.runDue(ctx)
+			}
+		}
+	}()
+	return done
+}
+
+func runCommand(ctx context.Context, log *slog.Logger, client *agentclient.Client, exec *svcctl.Executor, c svcactions.Pending) {
+	log.Info("executando comando de serviço", "id", c.ID, "service", c.ServiceKey, "action", c.Action, "target", c.Target)
+	var status, msg string
+	switch {
+	case c.ServiceKey == procs.ServiceKey:
+		status, msg = exec.ExecuteProcess(ctx, c.Target, c.Action)
+	case c.Target != "":
+		status, msg = exec.ExecuteContainer(ctx, c.Target, c.Action)
+	default:
+		status, msg = exec.Execute(ctx, c.ServiceKey, c.Action)
+	}
+	log.Info("comando de serviço concluído", "id", c.ID, "status", status, "message", msg)
+	// O resultado é gravado mesmo durante o desligamento do agente (ele pode ter derrubado o nginx da própria API,
+	// por isso com mais tentativas e prazo próprio).
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 90*time.Second)
+	defer cancel()
+	rc := *client
+	rc.MaxAttempts = 6
+	if err := rc.Do(rctx, "POST", "/api/v1/agent/commands/"+c.ID+"/result", svcactions.Result{Status: status, Message: msg}, nil); err != nil {
+		log.Warn("envio do resultado do comando falhou", "id", c.ID, "err", err)
+	}
 }

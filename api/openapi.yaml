@@ -882,6 +882,314 @@ paths:
         "400": { $ref: "#/components/responses/InvalidId" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/servers/{id}/services/{key}/actions:
+    parameters:
+      - { $ref: "#/components/parameters/ServerId" }
+      - { name: key, in: path, required: true, schema: { $ref: "#/components/schemas/DiscoveryKey" } }
+    post:
+      tags: [services]
+      summary: Inicia, para ou reinicia um serviço do servidor
+      description: |
+        Pede ao agente do servidor para executar `systemctl start|stop|restart` na unidade do serviço. A execução é
+        **assíncrona**: responde 202 com o comando (`status: pending`) e o agente o executa em até ~5 s; acompanhe por
+        `GET /service-commands/{id}`. Quem pediu (usuário, e-mail e IP) fica gravado no comando e na auditoria (`service.start`,
+        `service.stop`, `service.restart`; o resultado vem do agente em `service.result`).
+        Regras: só serviços cuja unidade é do systemd (processos soltos e containers Docker não); `start` só se o serviço
+        está parado, `stop`/`restart` só se está em execução; o SSH só pode ser iniciado/reiniciado (parar poderia trancar o
+        administrador fora do servidor); `journald` e `ufw` não têm ação. A lista do que é permitido agora vem em `actions` de
+        `GET /servers/{id}/discovery`. Um comando que o agente não buscar em 2 min expira (`expired`).
+        Atenção: parar um serviço fará o alerta "Serviço indisponível" disparar após o tempo da regra.
+      operationId: requestServiceAction
+      x-required-role: operator
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: { type: string, enum: [start, stop, restart] }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "202":
+          description: Comando registrado; o agente o executará
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: "#/components/schemas/ServiceCommand" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Já existe um comando em andamento para o serviço (COMMAND_IN_PROGRESS), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { description: "Ação inválida (VALIDATION_ERROR) ou não permitida para o estado do serviço (ACTION_NOT_ALLOWED)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /api/v1/servers/{id}/service-commands:
+    parameters:
+      - { $ref: "#/components/parameters/ServerId" }
+    get:
+      tags: [services]
+      summary: Comandos de serviço recentes do servidor
+      description: Mais recentes primeiro (padrão 20, máximo 100 por `limit`), com quem pediu e o resultado.
+      operationId: listServiceCommands
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Comandos
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/ServiceCommand" } }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Validation" }
+  /api/v1/service-commands/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [services]
+      summary: Estado de um comando de serviço
+      operationId: getServiceCommand
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Comando
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: "#/components/schemas/ServiceCommand" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/servers/{id}/processes:
+    parameters:
+      - { $ref: "#/components/parameters/ServerId" }
+    get:
+      tags: [services]
+      summary: Processos do servidor (CPU e memória)
+      description: |
+        Último retrato dos processos enviado pelo agente (a cada ~30 s e logo depois de cada encerramento). A lista traz até 300
+        processos: os que mais usam CPU e, para completar, os que mais usam memória; `total` é quantos existem no servidor e
+        `matched` quantos casam com `q` (antes de `limit`). Threads de kernel não entram. `cpu_percent` vai de 0 a 100 por CPU
+        (100 = um núcleo inteiro; o máximo é `100 * cpus`), medido entre duas leituras do /proc. `memory_bytes` é o RSS: páginas
+        compartilhadas entre processos (nginx, postgres...) são contadas em cada um, então a soma pode passar da RAM.
+        `cmdline` tem os segredos aparentes mascarados (`--password=***`), mas isso é heurístico.
+        `actions` é `[terminate, kill]` só nos processos que o agente pode encerrar; nos demais é `[]` e `restriction`
+        diz o motivo (`critical`, `self`, `container`, `service`, `other_user`), com o texto em `restriction_message`.
+      operationId: getServerProcesses
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - { name: sort, in: query, schema: { type: string, enum: [cpu, memory, pid, name], default: cpu } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+        - { name: q, in: query, schema: { type: string, maxLength: 100 }, description: "Filtra por nome, linha de comando, usuário ou pid (sem diferenciar maiúsculas)" }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/Validation" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Processos do servidor
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: "#/components/schemas/ServerProcesses" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/servers/{id}/processes/history:
+    parameters:
+      - { $ref: "#/components/parameters/ServerId" }
+    get:
+      tags: [services]
+      summary: Histórico dos maiores consumidores de CPU e memória
+      description: |
+        Quem mais usava CPU e memória no passado, para investigar um pico. A cada leitura do agente (~30 s; ~10 s enquanto a CPU ou a
+        RAM estão acima de 85 %) ficam gravados os 5 maiores por CPU e os 5 maiores por memória (união, sem repetir), sem a linha
+        de comando. Retenção igual à dos logs (`LOGS_RETENTION_DAYS`). `samples` vem da leitura mais antiga para a mais nova e cada uma
+        traz seus processos do maior para o menor CPU. Padrão: última hora; no máximo 7 dias; `truncated: true` se passou de 5000 linhas.
+        Processos que viveram menos que o intervalo de leitura podem não aparecer. Exige o ClickHouse (503 `LOGS_UNAVAILABLE` sem ele).
+      operationId: getServerProcessHistory
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date-time }, description: Início da janela (padrão, uma hora antes de `to`) }
+        - { name: to, in: query, schema: { type: string, format: date-time }, description: Fim da janela (padrão, agora) }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/Validation" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { description: ClickHouse indisponível (LOGS_UNAVAILABLE) }
+        "200":
+          description: Histórico
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      from: { type: string, format: date-time }
+                      to: { type: string, format: date-time }
+                      truncated: { type: boolean }
+                      samples:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            at: { type: string, format: date-time }
+                            processes:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  pid: { type: integer }
+                                  name: { type: string }
+                                  user: { type: string }
+                                  cpu_percent: { type: number }
+                                  memory_bytes: { type: integer, format: int64 }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/servers/{id}/processes/{pid}/actions:
+    parameters:
+      - { $ref: "#/components/parameters/ServerId" }
+      - { name: pid, in: path, required: true, schema: { type: integer, minimum: 2 } }
+    post:
+      tags: [services]
+      summary: Encerra um processo
+      description: |
+        Pede ao agente para encerrar o processo: `terminate` (SIGTERM, pede para sair) ou `kill` (SIGKILL, força). Só vale
+        para processos com `actions` na lista, ou seja, do MESMO usuário do agente (ele não roda como root) e fora de serviços
+        monitorados (use Parar/Reiniciar), containers e processos do sistema. `start_time` (do item da lista) é obrigatório e
+        evita atingir outro processo que reaproveitou o pid. Assíncrono: responde 202 com o comando (`service_key: process`,
+        `target: "<pid>:<start_time>"`) e o resultado vem em `GET /service-commands/{id}`. Se o processo ignorar o SIGTERM em
+        5 s, o comando termina em `failed` com a dica de usar `kill`. Quem pediu fica na auditoria (`process.terminate`,
+        `process.kill`; resultado em `service.result`). Um pedido por processo por vez.
+      operationId: requestProcessAction
+      x-required-role: operator
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action, start_time]
+              properties:
+                action: { type: string, enum: [terminate, kill] }
+                start_time: { type: integer, minimum: 1, description: "Campo start_time do processo na lista" }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "202":
+          description: Comando registrado; o agente o executará
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: "#/components/schemas/ServiceCommand" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Já existe um pedido em andamento para este processo (COMMAND_IN_PROGRESS) }
+        "422": { description: "Ação inválida, start_time ausente ou processo com restrição (ACTION_NOT_ALLOWED)" }
+  /api/v1/servers/{id}/docker:
+    parameters:
+      - { $ref: "#/components/parameters/ServerId" }
+    get:
+      tags: [services]
+      summary: Docker do servidor e seus containers
+      description: |
+        Diz se o servidor tem Docker e lista todos os containers (ativos e inativos), como o agente os enviou
+        (atualizado a cada ~1 min e logo depois de cada ação). `status`: `ok` (lista válida), `not_installed` (sem Docker),
+        `no_access` (Docker existe, mas o agente não tem permissão no socket; veja `message`), `unavailable` (instalado, mas o
+        daemon não responde) e `unknown` (o agente ainda não informou). Cada container traz `actions`: `restart` se está ativo,
+        `start` se está inativo. Nos inativos, `error` explica por que parou e `log_tail` traz o fim do log.
+      operationId: getServerDocker
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Estado do Docker
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: "#/components/schemas/ServerDocker" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/servers/{id}/docker/containers/{containerId}/actions:
+    parameters:
+      - { $ref: "#/components/parameters/ServerId" }
+      - { name: containerId, in: path, required: true, schema: { type: string, pattern: "^[0-9a-f]{64}$" }, description: Id completo do container (campo `id` de GET /servers/{id}/docker) }
+    post:
+      tags: [services]
+      summary: Inicia ou reinicia um container Docker
+      description: |
+        Pede ao agente para iniciar (container inativo) ou reiniciar (container ativo) o container. Assíncrono, como as ações
+        de serviço: responde 202 com o comando e o resultado vem em `GET /service-commands/{id}` (`target` = id do container).
+        Se o container não ficar ativo logo depois, o comando termina em `failed` e `message` traz o motivo. Quem pediu fica
+        na auditoria (`docker.start`, `docker.restart`; resultado em `service.result`). Um comando por container por vez.
+      operationId: requestContainerAction
+      x-required-role: operator
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: { type: string, enum: [start, restart] }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "202":
+          description: Comando registrado; o agente o executará
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: "#/components/schemas/ServiceCommand" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Já existe um comando em andamento para o container (COMMAND_IN_PROGRESS), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { description: "Ação inválida (VALIDATION_ERROR) ou incompatível com o estado do container (ACTION_NOT_ALLOWED)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /api/v1/servers/{id}/services:
     parameters:
       - { $ref: "#/components/parameters/ServerId" }
@@ -1613,6 +1921,131 @@ paths:
         "413": { $ref: "#/components/responses/TooLarge" }
         "422": { $ref: "#/components/responses/Validation" }
         "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v1/agent/docker:
+    post:
+      tags: [agent]
+      summary: Retrato do Docker do servidor
+      description: |
+        O agente informa se o servidor tem Docker (`status`) e a lista de containers; cada envio substitui o anterior.
+        O servidor vem da credencial. Até 100 containers; só `status: ok` aceita containers. Relatório mais antigo que o
+        gravado é ignorado.
+      operationId: agentDocker
+      security: [{ agentToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DockerReport" }
+      responses:
+        "200":
+          description: Gravado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: object, properties: { stored: { type: integer } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ServerDisabled" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "422": { $ref: "#/components/responses/Validation" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v1/agent/processes:
+    post:
+      tags: [agent]
+      summary: Retrato dos processos do servidor
+      description: |
+        O agente envia (a cada ~30 s) os processos que mais usam CPU e memória; cada envio substitui o anterior. O servidor vem
+        da credencial. Até 500 processos. `restriction` é um vocabulário fechado e os campos calculados pela API
+        (`memory_percent`, `service_name`, `actions`, `restriction_message`) são ignorados. Relatório mais antigo que o gravado é ignorado.
+      operationId: agentProcesses
+      security: [{ agentToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProcessReport" }
+      responses:
+        "200":
+          description: Gravado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: object, properties: { stored: { type: integer } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ServerDisabled" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "422": { $ref: "#/components/responses/Validation" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v1/agent/commands:
+    get:
+      tags: [agent]
+      summary: Comandos de serviço pendentes do servidor
+      description: |
+        Entrega (e marca como `running`) até 5 comandos pendentes do servidor da credencial. Só vão a chave do catálogo e a ação:
+        **nunca** nome de unidade nem comando. O agente resolve a unidade pela própria descoberta, confere com o catálogo e
+        executa `systemctl`. Consultado a cada ~5 s.
+      operationId: agentCommands
+      security: [{ agentToken: [] }]
+      responses:
+        "200":
+          description: Comandos pendentes (lista vazia quando não há)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, service_key, action]
+                      properties:
+                        id: { type: string, format: uuid }
+                        service_key: { $ref: "#/components/schemas/DiscoveryKey" }
+                        action: { type: string, enum: [start, stop, restart] }
+                        target: { type: string, description: "Id do container Docker (ausente em comando de serviço systemd)" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ServerDisabled" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v1/agent/commands/{id}/result:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [agent]
+      summary: Resultado de um comando de serviço
+      description: Só vale para comando `running` do próprio servidor. Grava o resultado e a auditoria `service.result`.
+      operationId: agentCommandResult
+      security: [{ agentToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [succeeded, failed] }
+                message: { type: string, maxLength: 300 }
+      responses:
+        "200":
+          description: Gravado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: object, properties: { stored: { type: boolean } } }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ServerDisabled" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: O comando não está em execução (INVALID_STATE), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "422": { $ref: "#/components/responses/Validation" }
+        "429": { $ref: "#/components/responses/RateLimited" }
   /api/v1/agent/logs:
     post:
       tags: [agent]
@@ -2097,7 +2530,7 @@ components:
       description: "`available` em execução; `stopped` instalado mas parado/desativado; `not_found` não instalado (nem em container, para redis e postgresql)"
     DiscoveryItem:
       type: object
-      required: [key, name, available, status, source, unit, action, checked_at, status_changed_at]
+      required: [key, name, available, status, source, unit, action, actions, checked_at, status_changed_at]
       properties:
         key: { $ref: "#/components/schemas/DiscoveryKey" }
         name: { type: string }
@@ -2106,8 +2539,154 @@ components:
         source: { type: string, enum: ["", systemd, process, docker], description: Onde foi encontrado }
         unit: { type: string, description: Unidade systemd, quando houver }
         action: { type: string, description: O que fazer para ficar disponível (vazio quando já está) }
+        actions:
+          type: array
+          items: { type: string, enum: [start, stop, restart] }
+          description: Comandos que o usuário pode pedir agora via POST /servers/{id}/services/{key}/actions (vazio = nenhum)
         checked_at: { type: string, format: date-time }
         status_changed_at: { type: string, format: date-time, nullable: true }
+    ServiceCommand:
+      type: object
+      required: [id, server_id, service_key, service_name, unit, target, action, status, requested_by, requested_actor, message, created_at, started_at, finished_at]
+      properties:
+        id: { type: string, format: uuid }
+        server_id: { type: string, format: uuid }
+        service_key:
+          type: string
+          description: 'Chave do catálogo de serviços; `docker` em comando de container e `process` em comando de processo'
+          enum: [ssh, journald, cron, timesyncd, ufw, rsyslog, nginx, redis, docker, postgresql, process]
+        service_name: { type: string }
+        unit: { type: string, description: "Unidade systemd; para container, o nome do container; para processo, o nome do processo" }
+        target: { type: string, description: 'Id do container Docker, ou "<pid>:<start_time>" em comando de processo (vazio em comando de serviço systemd)' }
+        action: { type: string, enum: [start, stop, restart, terminate, kill] }
+        status: { type: string, enum: [pending, running, succeeded, failed, expired] }
+        requested_by: { type: string, format: uuid, nullable: true, description: Usuário que pediu (nulo se a conta foi removida ou foi a chave de API) }
+        requested_actor: { type: string, description: "E-mail do usuário ou api_key" }
+        message: { type: string, description: Resultado em texto curto (vazio enquanto não terminou) }
+        created_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time, nullable: true }
+    ServerProcess:
+      type: object
+      required: [pid, start_time, ppid, name, cmdline, user, state, threads, cpu_percent, memory_bytes, memory_percent, service_key, service_name, restriction, restriction_message, actions]
+      properties:
+        pid: { type: integer }
+        start_time: { type: integer, description: "Início do processo em ticks do boot; identifica o processo junto com o pid (envie-o no POST de encerrar)" }
+        ppid: { type: integer }
+        name: { type: string }
+        cmdline: { type: string, description: "Linha de comando (até 200 caracteres, com segredos aparentes mascarados)" }
+        user: { type: string }
+        state: { type: string, description: "R executando, S dormindo, D em E/S, T parado, Z zumbi..." }
+        threads: { type: integer }
+        cpu_percent: { type: number, description: "0 a 100*cpus; 100 = um núcleo inteiro" }
+        memory_bytes: { type: integer, format: int64, description: RSS }
+        memory_percent: { type: number, description: "RSS sobre a RAM total, com uma casa decimal" }
+        service_key: { type: string, description: "Serviço monitorado a que pertence (vazio = nenhum)" }
+        service_name: { type: string }
+        restriction: { type: string, enum: ["", critical, self, container, service, other_user], description: "Por que não pode ser encerrado (vazio = pode)" }
+        restriction_message: { type: string }
+        actions:
+          type: array
+          items: { type: string, enum: [terminate, kill] }
+    ServerProcesses:
+      type: object
+      required: [status, message, checked_at, cpus, memory_total_bytes, total, matched, processes]
+      properties:
+        status: { type: string, enum: [ok, unknown], description: "unknown = o agente ainda não informou" }
+        message: { type: string }
+        checked_at: { type: string, format: date-time, nullable: true }
+        cpus: { type: integer }
+        memory_total_bytes: { type: integer, format: int64 }
+        total: { type: integer, description: Processos existentes no servidor (a lista pode ser menor) }
+        matched: { type: integer, description: Processos que casam com `q`, antes de `limit` }
+        processes: { type: array, items: { $ref: "#/components/schemas/ServerProcess" } }
+    ProcessReport:
+      type: object
+      required: [checked_at, cpus]
+      properties:
+        checked_at: { type: string, format: date-time }
+        cpus: { type: integer, minimum: 1, maximum: 4096 }
+        memory_total_bytes: { type: integer, format: int64 }
+        total: { type: integer }
+        processes:
+          type: array
+          maxItems: 500
+          items:
+            type: object
+            required: [pid, start_time, name, state]
+            properties:
+              pid: { type: integer, minimum: 1 }
+              start_time: { type: integer }
+              ppid: { type: integer }
+              name: { type: string, maxLength: 64 }
+              cmdline: { type: string, maxLength: 200 }
+              user: { type: string, maxLength: 48 }
+              state: { type: string, minLength: 1, maxLength: 1 }
+              threads: { type: integer }
+              cpu_percent: { type: number, minimum: 0 }
+              memory_bytes: { type: integer, format: int64, minimum: 0 }
+              service_key: { $ref: "#/components/schemas/DiscoveryKey" }
+              restriction: { type: string, enum: ["", critical, self, container, service, other_user] }
+    DockerContainer:
+      type: object
+      required: [id, name, image, state, status, exit_code, oom_killed, error, log_tail, started_at, finished_at, actions]
+      properties:
+        id: { type: string, pattern: "^[0-9a-f]{64}$" }
+        name: { type: string }
+        image: { type: string }
+        state: { type: string, enum: [running, exited, created, paused, restarting, dead, removing] }
+        status: { type: string, description: 'Texto do Docker ("Up 3 hours", "Exited (1) 2 minutes ago")' }
+        exit_code: { type: integer, nullable: true, description: Código de saída (só em container que já rodou e não está ativo) }
+        oom_killed: { type: boolean }
+        error: { type: string, description: "Por que não está ativo (vazio quando ativo): erro do Docker, falta de memória, código de saída" }
+        log_tail: { type: string, description: "Últimas linhas do log (só de container inativo; pode conter dados sensíveis da aplicação)" }
+        started_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time, nullable: true }
+        actions:
+          type: array
+          items: { type: string, enum: [start, restart] }
+          description: "restart se ativo, start se inativo, vazio se pausado ou em remoção"
+    ServerDocker:
+      type: object
+      required: [status, message, checked_at, summary, containers]
+      properties:
+        status: { type: string, enum: [ok, not_installed, no_access, unavailable, unknown] }
+        message: { type: string, description: Explicação quando status não é ok }
+        checked_at: { type: string, format: date-time, nullable: true }
+        summary:
+          type: object
+          required: [total, running, stopped, other]
+          properties:
+            total: { type: integer }
+            running: { type: integer }
+            stopped: { type: integer }
+            other: { type: integer }
+        containers: { type: array, items: { $ref: "#/components/schemas/DockerContainer" } }
+    DockerReport:
+      type: object
+      required: [checked_at, status]
+      properties:
+        checked_at: { type: string, format: date-time }
+        status: { type: string, enum: [ok, not_installed, no_access, unavailable] }
+        message: { type: string, maxLength: 300 }
+        containers:
+          type: array
+          maxItems: 100
+          items:
+            type: object
+            required: [id, state]
+            properties:
+              id: { type: string, pattern: "^[0-9a-f]{64}$" }
+              name: { type: string }
+              image: { type: string }
+              state: { type: string, enum: [running, exited, created, paused, restarting, dead, removing] }
+              status: { type: string }
+              exit_code: { type: integer, nullable: true }
+              oom_killed: { type: boolean }
+              error: { type: string }
+              log_tail: { type: string, maxLength: 2000 }
+              started_at: { type: string, format: date-time, nullable: true }
+              finished_at: { type: string, format: date-time, nullable: true }
     ServerDiscovery:
       type: object
       required: [summary, services, checked_at]
@@ -2198,6 +2777,30 @@ components:
         resolved_at: { type: string, format: date-time, nullable: true }
         resolved_reason: { type: string, nullable: true, enum: [recovered, manual, rule_disabled, rule_deleted, out_of_scope] }
         last_evaluated_at: { type: string, format: date-time }
+        culprits: { $ref: "#/components/schemas/AlertCulprits" }
+    AlertCulprits:
+      type: object
+      nullable: true
+      description: |
+        Maiores consumidores de CPU ou memória quando o alerta disparou (regras `cpu_high`, `load_high`, `memory_low`, `swap_high`
+        e `oom_kill`); nulo nas demais regras ou quando não havia dados. `message` já traz o mesmo texto em português.
+      properties:
+        kind: { type: string, enum: [cpu, memory], description: "O que foi ordenado: cpu (CPU e load) ou memory (RAM, swap e OOM)" }
+        source: { type: string, enum: [history, snapshot], description: "history = média das leituras da janela em que a condição valia; snapshot = só a última leitura (sem histórico)" }
+        window_seconds: { type: integer, description: "Janela do histórico (0 em snapshot)" }
+        at: { type: string, format: date-time }
+        processes:
+          type: array
+          description: "Até 3, do maior para o menor. Processos de mesmo nome (workers) vêm somados."
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              user: { type: string }
+              cpu_percent: { type: number, description: "Média na janela; 100 = um núcleo" }
+              cpu_peak: { type: number, description: Maior valor numa leitura }
+              memory_bytes: { type: integer, format: int64, description: Média na janela }
+              memory_peak_bytes: { type: integer, format: int64 }
     Incident:
       type: object
       properties:
@@ -2232,6 +2835,7 @@ components:
                   message: { type: string }
                   triggered_at: { type: string, format: date-time }
                   resolved_at: { type: string, format: date-time, nullable: true }
+                  culprits: { $ref: "#/components/schemas/AlertCulprits" }
     IncidentEvent:
       type: object
       properties:

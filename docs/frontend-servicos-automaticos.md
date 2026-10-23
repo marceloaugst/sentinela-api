@@ -194,6 +194,37 @@ Portanto as telas de **alertas, incidentes e regras** não mudam. Se existir lis
 
 ---
 
+## 4.1 Iniciar, parar e reiniciar (botões na aba Serviços)
+
+Cada item de `GET /servers/{id}/discovery` ganhou **`actions`**: o que o usuário pode pedir **agora** (`[]` = sem botões).
+
+| Situação | `actions` |
+|---|---|
+| Em execução via systemd | `["stop","restart"]` (SSH: só `["restart"]`) |
+| Instalado e parado | `["start"]` |
+| Docker, processo solto, não instalado, `journald`, `ufw` | `[]` |
+
+**Quem vê os botões:** só `operator` e `admin` (para `viewer` esconda; a API devolve 403 mesmo assim). Peça **confirmação** antes de `stop`/`restart` (avise que parar o serviço dispara o alerta "Serviço indisponível" em ~2 min).
+
+```
+POST /api/v1/servers/{id}/services/{key}/actions     { "action": "restart" }     → 202
+{ "data": { "id": "…", "service_key": "nginx", "service_name": "Nginx", "unit": "nginx.service",
+            "action": "restart", "status": "pending", "requested_actor": "ana@empresa.com", "message": "", … } }
+```
+
+A execução é **assíncrona**: o agente busca o comando em até ~5 s. Faça polling em `GET /service-commands/{id}` (a cada 2 s) até `status` ser `succeeded`, `failed` ou `expired`; depois recarregue `GET /servers/{id}/discovery` (o agente já reenviou o novo estado). Estados: `pending` (esperando o agente) → `running` → `succeeded | failed | expired`; mostre `message` quando `failed`/`expired`.
+
+| Erro | Quando | O que mostrar |
+|---|---|---|
+| `403 FORBIDDEN` | `viewer` | "Sem permissão" |
+| `404` | servidor ou serviço inexistente/nunca descoberto | recarregar a tela |
+| `409 COMMAND_IN_PROGRESS` | já há comando pendente/em execução do serviço | "Aguarde o comando em andamento" (desabilite os botões enquanto houver) |
+| `422 ACTION_NOT_ALLOWED` | estado mudou (ex.: já estava parado) | recarregar a descoberta |
+
+Histórico por servidor: `GET /servers/{id}/service-commands?limit=20` (quem pediu em `requested_actor`). A tela de **Auditoria** (admin) já mostra as ações `service.start`, `service.stop`, `service.restart` e `service.result` (filtro `action=service.`).
+
+---
+
 ## 5. Checklist de implementação
 
 1. [ ] Remover botão/tela/formulário de **criar, editar, excluir** serviço.
@@ -205,6 +236,7 @@ Portanto as telas de **alertas, incidentes e regras** não mudam. Se existir lis
 7. [ ] Manter a lista global `GET /services` como somente leitura, ocultando `target`/`config`/latência.
 8. [ ] Atualizar a tela por polling (30–60 s) ou SSE.
 9. [ ] Tratar `404` de rotas antigas durante a transição (versões em cache do front).
+10. [ ] Botões Iniciar/Parar/Reiniciar a partir de `actions` (só operator/admin), com confirmação e polling de `GET /service-commands/{id}` (seção 4.1).
 
 ---
 

@@ -92,7 +92,7 @@ Tipos: `server.status_changed`, `metrics.updated` (opt-in, no máximo 1 a cada 5
 | Lista de servidores | `GET /servers` (filtros `q`, `status`, `connection`, `sort`, `order`) |
 | Detalhe do servidor | `GET /servers/{id}`, `/servers/{id}/summary`, `/servers/{id}/metrics`, `/servers/{id}/disks`, `/servers/{id}/services`, `/servers/{id}/discovery`, `/servers/{id}/incidents` |
 | Cadastro / credencial do agente | `POST /servers`, `PATCH /servers/{id}`, `POST /servers/{id}/agent-credentials` (o token aparece **uma única vez**) |
-| Serviços (descobertos automaticamente, somente leitura) | `GET /services`, `GET /services/{id}` |
+| Serviços (descobertos automaticamente) | `GET /services`, `GET /services/{id}` (leitura); **iniciar/parar/reiniciar**: `POST /servers/{id}/services/{key}/actions` (operator), `GET /service-commands/{id}`, `GET /servers/{id}/service-commands` — veja `docs/frontend-servicos-automaticos.md` §4.1 |
 | Alertas e regras | `GET /alerts`, `POST /alerts/{id}/acknowledge`, `POST /alerts/{id}/resolve`, `GET /alert-rules`, `GET /alert-rules/{id}` (somente leitura: as regras são automáticas) |
 | Incidentes | `GET /incidents`, `GET /incidents/{id}`, `GET /incidents/{id}/events` |
 | Notificações (Telegram) | `GET/POST /notification-channels`, `PATCH/DELETE /notification-channels/{id}`, `POST /notification-channels/{id}/test` |

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"sentinela/internal/logs"
+	"sentinela/internal/procs"
 	"sentinela/internal/sysmetrics"
 )
 
@@ -194,5 +195,67 @@ func TestSystemMetricsInsertAndLatest(t *testing.T) {
 	}
 	if i := got[srvA+"|inode_used_percent|/"]; i.Latest != 95 {
 		t.Errorf("inodes: %+v", i)
+	}
+}
+
+func TestProcessHistory(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	if err := s.exec(ctx, "TRUNCATE TABLE "+s.procTable(), nil); err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Now().UTC().Truncate(time.Second).Add(-10 * time.Minute)
+	at := func(i int) time.Time { return t0.Add(time.Duration(i) * 30 * time.Second) }
+	// 4 leituras; "node" aparece nas 4 (80% CPU), "backup" só em 1 (100% CPU) e "postgres" tem 2 workers em todas.
+	for i := 0; i < 4; i++ {
+		samples := []procs.TopSample{
+			{At: at(i), PID: 10, Name: "node", User: "app", CPUPercent: 80, MemoryBytes: 100 << 20},
+			{At: at(i), PID: 20, Name: "postgres", User: "pg", CPUPercent: 2, MemoryBytes: 500 << 20},
+			{At: at(i), PID: 21, Name: "postgres", User: "pg", CPUPercent: 2, MemoryBytes: 300 << 20},
+		}
+		if i == 2 {
+			samples = append(samples, procs.TopSample{At: at(i), PID: 30, Name: "backup", User: "root", CPUPercent: 100, MemoryBytes: 10 << 20})
+		}
+		if err := s.InsertProcTop(ctx, srvA, samples); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 { // reenvio da mesma leitura não duplica
+			if err := s.InsertProcTop(ctx, srvA, samples); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := s.InsertProcTop(ctx, srvB, []procs.TopSample{{At: at(0), PID: 99, Name: "outro", CPUPercent: 50}}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.ProcTopRange(ctx, srvA, t0.Add(-time.Minute), t0.Add(time.Hour), 1000)
+	if err != nil || len(rows) != 13 {
+		t.Fatalf("faixa: %d linhas, %v", len(rows), err)
+	}
+	if !rows[0].At.Equal(at(0)) || rows[0].Name != "backup" && rows[0].Name != "node" || rows[0].CPUPercent != 80 {
+		t.Errorf("ordem (instante, CPU desc): %+v", rows[0])
+	}
+	if sub, _ := s.ProcTopRange(ctx, srvA, at(1).Add(-time.Second), at(1).Add(time.Second), 1000); len(sub) != 3 {
+		t.Errorf("recorte de uma leitura: %d", len(sub))
+	}
+
+	cpu, n, err := s.ProcCulprits(ctx, srvA, t0.Add(-time.Minute), t0.Add(time.Hour), procs.KindCPU, 3)
+	if err != nil || n != 4 || len(cpu) != 3 {
+		t.Fatalf("culpados cpu: n=%d %+v %v", n, cpu, err)
+	}
+	if cpu[0].Name != "node" || cpu[0].CPUPercent != 80 || cpu[0].CPUPeak != 80 {
+		t.Errorf("node: %+v", cpu[0])
+	}
+	// backup: 100% em 1 de 4 leituras => média 25, pico 100; postgres: 2 workers somam 4% em todas
+	if cpu[1].Name != "backup" || cpu[1].CPUPercent != 25 || cpu[1].CPUPeak != 100 || cpu[2].Name != "postgres" || cpu[2].CPUPercent != 4 {
+		t.Errorf("demais: %+v", cpu[1:])
+	}
+	mem, _, err := s.ProcCulprits(ctx, srvA, t0.Add(-time.Minute), t0.Add(time.Hour), procs.KindMemory, 1)
+	if err != nil || len(mem) != 1 || mem[0].Name != "postgres" || mem[0].MemoryBytes != 800<<20 {
+		t.Errorf("memória (workers somados): %+v %v", mem, err)
+	}
+	if none, n, err := s.ProcCulprits(ctx, srvA, t0.Add(time.Hour), t0.Add(2*time.Hour), procs.KindCPU, 3); err != nil || n != 0 || len(none) != 0 {
+		t.Errorf("janela vazia: %d %+v %v", n, none, err)
 	}
 }

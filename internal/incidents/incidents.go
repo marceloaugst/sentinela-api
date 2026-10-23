@@ -8,6 +8,7 @@ package incidents
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -55,6 +56,8 @@ type AlertRef struct {
 	Message     string     `json:"message"`
 	TriggeredAt time.Time  `json:"triggered_at"`
 	ResolvedAt  *time.Time `json:"resolved_at"`
+	// Culprits: maiores consumidores de CPU/memória quando o alerta disparou (nulo se não se aplica).
+	Culprits json.RawMessage `json:"culprits"`
 }
 
 type Detail struct {
@@ -140,7 +143,7 @@ func (r *Repository) Get(ctx context.Context, id string) (Detail, error) {
 		return Detail{}, err
 	}
 	d := Detail{Incident: i, Alerts: []AlertRef{}}
-	rows, err := r.pool.Query(ctx, `SELECT id, status, severity, message, triggered_at, resolved_at FROM alerts
+	rows, err := r.pool.Query(ctx, `SELECT id, status, severity, message, triggered_at, resolved_at, culprits FROM alerts
 		WHERE incident_id = $1 ORDER BY triggered_at, id`, id)
 	if err != nil {
 		return Detail{}, err
@@ -148,7 +151,7 @@ func (r *Repository) Get(ctx context.Context, id string) (Detail, error) {
 	defer rows.Close()
 	for rows.Next() {
 		var a AlertRef
-		if err := rows.Scan(&a.ID, &a.Status, &a.Severity, &a.Message, &a.TriggeredAt, &a.ResolvedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.Status, &a.Severity, &a.Message, &a.TriggeredAt, &a.ResolvedAt, &a.Culprits); err != nil {
 			return Detail{}, err
 		}
 		d.Alerts = append(d.Alerts, a)

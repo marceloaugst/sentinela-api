@@ -17,6 +17,7 @@ import (
 	"sentinela/internal/config"
 	"sentinela/internal/dashboard"
 	"sentinela/internal/discovery"
+	"sentinela/internal/dockerhost"
 	"sentinela/internal/events"
 	"sentinela/internal/http/handlers"
 	"sentinela/internal/http/middleware"
@@ -26,10 +27,12 @@ import (
 	"sentinela/internal/metrics"
 	"sentinela/internal/notifications"
 	"sentinela/internal/passwords"
+	"sentinela/internal/procs"
 	"sentinela/internal/ratelimit"
 	"sentinela/internal/secrets"
 	"sentinela/internal/servers"
 	"sentinela/internal/services"
+	"sentinela/internal/svcactions"
 	"sentinela/internal/telemetry"
 	"sentinela/internal/users"
 )
@@ -154,6 +157,9 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 	dashRepo := dashboard.NewRepository(d.Pool, cfg.AgentHeartbeatTimeout)
 	svcRepo := services.NewRepository(d.Pool)
 	discRepo := discovery.NewRepository(d.Pool)
+	actRepo := svcactions.NewRepository(d.Pool)
+	dockRepo := dockerhost.NewRepository(d.Pool)
+	procRepo := procs.NewRepository(d.Pool)
 	alertRepo := alerts.NewRepository(d.Pool)
 	incRepo := incidents.NewRepository(d.Pool)
 	var box *secrets.Box
@@ -168,6 +174,9 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 	sh := handlers.Servers{Repo: srvRepo, Creds: credRepo, Log: d.Log, TrustProxy: cfg.TrustProxy}
 	svh := handlers.Services{Repo: svcRepo, Servers: srvRepo, Log: d.Log}
 	dsh := handlers.Discovery{Repo: discRepo, Servers: srvRepo, Log: d.Log}
+	dkh := handlers.Docker{Repo: dockRepo, Actions: actRepo, Servers: srvRepo, Log: d.Log, TrustProxy: cfg.TrustProxy}
+	prh := handlers.Processes{Repo: procRepo, Actions: actRepo, Servers: srvRepo, Log: d.Log, TrustProxy: cfg.TrustProxy}
+	sah := handlers.ServiceActions{Repo: actRepo, Servers: srvRepo, Log: d.Log, TrustProxy: cfg.TrustProxy}
 	alh := handlers.Alerts{Repo: alertRepo, Log: d.Log, TrustProxy: cfg.TrustProxy}
 	inh := handlers.Incidents{Repo: incRepo, Servers: srvRepo, Log: d.Log}
 	nth := handlers.Notifications{Store: notifications.NewStore(d.Pool), Log: d.Log, TrustProxy: cfg.TrustProxy}
@@ -184,9 +193,12 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 		lgh.Store = d.Logs
 	}
 	smh := &handlers.SystemMetrics{Log: d.Log}
+	var procHist handlers.ProcHistoryStore
 	if d.Logs != nil {
 		smh.Store = d.Logs
+		procHist = d.Logs
 	}
+	prh.History = procHist
 
 	// Respostas da API nunca são guardadas em cache e há um limite de taxa por IP.
 	apiLimiter := ratelimit.New(float64(cfg.APIRateLimit), cfg.APIRateBurst)
@@ -244,6 +256,20 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 		route("GET", "/services", V, svh.List)
 		route("GET", "/services/{id}", V, svh.Get)
 
+		// comandos de serviço (iniciar, parar, reiniciar): executados pelo agente, sempre auditados
+		route("POST", "/servers/{id}/services/{key}/actions", O, sah.Request)
+		route("GET", "/servers/{id}/service-commands", V, sah.ListByServer)
+		route("GET", "/service-commands/{id}", V, sah.Get)
+
+		// Docker: containers do servidor (enviados pelo agente) e ações iniciar/reiniciar
+		route("GET", "/servers/{id}/docker", V, dkh.Get)
+		route("POST", "/servers/{id}/docker/containers/{containerId}/actions", O, dkh.Request)
+
+		// processos do servidor (enviados pelo agente) e encerrar (restrito; veja internal/procs)
+		route("GET", "/servers/{id}/processes", V, prh.Get)
+		route("GET", "/servers/{id}/processes/history", V, prh.HistoryList)
+		route("POST", "/servers/{id}/processes/{pid}/actions", O, prh.Request)
+
 		// regras (catálogo automático, somente leitura) e alertas
 		route("GET", "/alert-rules", V, alh.ListRules)
 		route("GET", "/alert-rules/{id}", V, alh.GetRule)
@@ -287,7 +313,7 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 		agentAuth.ByCred = ratelimit.New(float64(cfg.AgentRatePerSecond), cfg.AgentRateBurst)
 	}
 	agh := handlers.Agent{
-		Metrics: metRepo, Services: svcRepo, Discovery: discRepo, Log: d.Log,
+		Metrics: metRepo, Services: svcRepo, Discovery: discRepo, Docker: dockRepo, Procs: procRepo, ProcHistory: procHist, SvcCommands: actRepo, Log: d.Log,
 		CollectInterval: cfg.AgentCollectInterval, HeartbeatTimeout: cfg.AgentHeartbeatTimeout,
 		Samples: d.Metrics.Samples,
 		Live:    events.NewLivePublisher(d.Pool, d.Log, 5*time.Second),
@@ -302,6 +328,10 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 			{"POST", "/heartbeat", handlers.MaxAgentBodyBytes, agh.Heartbeat}, {"POST", "/metrics", handlers.MaxAgentBodyBytes, agh.PostMetrics},
 			{"GET", "/config", handlers.MaxAgentBodyBytes, agh.Config},
 			{"POST", "/discovery", handlers.MaxAgentBodyBytes, agh.PostDiscovery},
+			{"POST", "/docker", handlers.MaxDockerBodyBytes, agh.PostDocker},
+			{"POST", "/processes", handlers.MaxProcessesBodyBytes, agh.PostProcesses},
+			{"GET", "/commands", handlers.MaxAgentBodyBytes, agh.Commands},
+			{"POST", "/commands/{id}/result", handlers.MaxAgentBodyBytes, agh.CommandResult},
 			{"POST", "/logs", handlers.MaxLogBatchBytes, lgh.PostLogs},
 			{"POST", "/system-metrics", handlers.MaxSystemBatchBytes, smh.Post},
 		} {

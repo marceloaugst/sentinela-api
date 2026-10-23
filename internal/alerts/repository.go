@@ -2,6 +2,7 @@ package alerts
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -118,10 +119,12 @@ type Alert struct {
 	ResolvedAt      *time.Time `json:"resolved_at"`
 	ResolvedReason  *string    `json:"resolved_reason"`
 	LastEvaluatedAt time.Time  `json:"last_evaluated_at"`
+	// Culprits são os maiores consumidores de CPU/memória quando o alerta disparou (nulo nas regras sem relação com processos).
+	Culprits json.RawMessage `json:"culprits"`
 }
 
 const alertSelect = `SELECT a.id, a.rule_id, r.name, a.server_id, s.name, a.service_id, ms.name, a.incident_id, a.status, r.priority, a.severity,
-		a.message, a.value, a.triggered_at, a.acknowledged_at, a.acknowledged_by::text, a.resolved_at, a.resolved_reason, a.last_evaluated_at
+		a.message, a.value, a.triggered_at, a.acknowledged_at, a.acknowledged_by::text, a.resolved_at, a.resolved_reason, a.last_evaluated_at, a.culprits
 	FROM alerts a JOIN alert_rules r ON r.id = a.rule_id JOIN servers s ON s.id = a.server_id
 	LEFT JOIN monitored_services ms ON ms.id = a.service_id`
 
@@ -129,7 +132,7 @@ func scanAlert(row pgx.Row) (Alert, error) {
 	var a Alert
 	err := row.Scan(&a.ID, &a.RuleID, &a.RuleName, &a.ServerID, &a.ServerName, &a.ServiceID, &a.ServiceName, &a.IncidentID,
 		&a.Status, &a.Priority, &a.Severity, &a.Message, &a.Value, &a.TriggeredAt, &a.AcknowledgedAt, &a.AcknowledgedBy, &a.ResolvedAt,
-		&a.ResolvedReason, &a.LastEvaluatedAt)
+		&a.ResolvedReason, &a.LastEvaluatedAt, &a.Culprits)
 	return a, err
 }
 

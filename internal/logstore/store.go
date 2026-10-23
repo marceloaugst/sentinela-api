@@ -95,6 +95,9 @@ func (s *Store) Init(ctx context.Context) error {
 	if err := s.initSystem(ctx); err != nil {
 		return err
 	}
+	if err := s.initProcs(ctx); err != nil {
+		return err
+	}
 	s.ready.Store(true)
 	return nil
 }

@@ -130,13 +130,15 @@ func (rep *Report) Validate(now time.Time) validation.Problems {
 
 // Item é a visão devolvida ao frontend: o fato + nome amigável + o que fazer.
 type Item struct {
-	Key             string     `json:"key"`
-	Name            string     `json:"name"`
-	Available       bool       `json:"available"`
-	Status          string     `json:"status"`
-	Source          string     `json:"source"`
-	Unit            string     `json:"unit"`
-	Action          string     `json:"action"` // vazio quando já está disponível
+	Key       string `json:"key"`
+	Name      string `json:"name"`
+	Available bool   `json:"available"`
+	Status    string `json:"status"`
+	Source    string `json:"source"`
+	Unit      string `json:"unit"`
+	Action    string `json:"action"` // vazio quando já está disponível
+	// Actions lista o que o usuário pode pedir agora (start, stop, restart). Preenchido pelo handler.
+	Actions         []string   `json:"actions"`
 	CheckedAt       time.Time  `json:"checked_at"`
 	StatusChangedAt *time.Time `json:"status_changed_at"`
 }

@@ -190,6 +190,7 @@ func run(args []string) error {
 	evaluator := &alerts.Evaluator{Pool: pool, Log: log, HeartbeatTimeout: cfg.AgentHeartbeatTimeout, Metrics: metrics}
 	if logStore != nil { // métricas de sistema (OOM, inodes, NTP, certificados...) vivem no ClickHouse
 		evaluator.System = logStore
+		evaluator.Procs = logStore
 	}
 	spawn(func() {
 		scheduler.Loop(jobCtx, "alert_evaluation", cfg.AlertEvaluationInterval, metrics, log, evaluator.Tick)

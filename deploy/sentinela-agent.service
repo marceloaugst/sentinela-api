@@ -1,5 +1,8 @@
 # /etc/systemd/system/sentinela-agent.service
-# Instalação: veja deploy/install-agent.sh. O agente só faz requisições de SAÍDA e não executa comandos.
+# Instalação: veja deploy/install-agent.sh. O agente só faz requisições de SAÍDA. A única coisa que executa a pedido da API
+# é `systemctl start|stop|restart` nas unidades do catálogo, e só porque a regra polkit deploy/50-sentinela-agent.rules deixa.
+# Docker (opcional): `update.sh --docker` cria o drop-in sentinela-agent.service.d/docker.conf com SupplementaryGroups=docker,
+# o que permite listar/iniciar/reiniciar containers. Acesso ao socket do Docker equivale a root: só ative se aceitar esse risco.
 [Unit]
 Description=Sentinela Agent (monitoramento)
 Documentation=https://github.com/seu-usuario/sentinela
@@ -25,7 +28,7 @@ SupplementaryGroups=adm
 # Posição de leitura dos logs (sobrevive a reinícios), em /var/lib/sentinela
 StateDirectory=sentinela
 StateDirectoryMode=0700
-# Endurecimento: o agente só lê /proc, /sys e statfs.
+# Endurecimento: o agente lê /proc, /sys e statfs; sem capabilities (o systemctl pede autorização ao polkit via D-Bus).
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

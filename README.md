@@ -16,12 +16,12 @@ Monitoramento de servidores Linux: uma **API REST em Go** (PostgreSQL) que receb
         Telegram ◄──────────────── notificações de alertas ◄──────────────┘
 ```
 
-1. **Agente** (`cmd/agent`): binário único, sem dependências. Só lê `/proc`, não abre portas e **nunca executa comandos** vindos da API. Envia heartbeat e métricas por HTTPS com um token individual (`snt_...`).
+1. **Agente** (`cmd/agent`): binário único, sem dependências. Só lê `/proc` e não abre portas; a única coisa que executa a pedido da API é `systemctl start|stop|restart` nas unidades do catálogo, sem privilégio de root (polkit) e auditada. Envia heartbeat e métricas por HTTPS com um token individual (`snt_...`).
 2. **API** (`cmd/api`): guarda métricas, calcula séries agregadas, avalia regras de alerta (com máquina de estados persistida), abre e fecha incidentes, espelha os serviços descobertos pelos agentes (sem cadastro) em alertas e incidentes e envia notificações.
 3. **Tempo real**: `GET /api/v1/events` (SSE) com replay por `Last-Event-ID`, funcionando com várias instâncias da API sem broker externo.
 4. **Acesso**: login por sessão (cookie `HttpOnly`), papéis `viewer < operator < admin`, proteção CSRF, bloqueio de força bruta, Argon2id e auditoria de ações.
 
-Documentação detalhada: [arquitetura](docs/architecture.md) · [API](docs/api.md) · [guia para o frontend](docs/frontend-api.md) · [implantação](docs/deployment.md) · [agente](docs/agent.md) · [eventos](docs/events.md) · [segurança](docs/security.md) · [OpenAPI](api/openapi.yaml)
+Documentação detalhada: [arquitetura](docs/architecture.md) · [API](docs/api.md) · [guia para o frontend](docs/frontend-api.md) · [implantação](docs/deployment.md) · [agente](docs/agent.md) · [serviços: iniciar/parar/reiniciar (frontend)](docs/frontend-servicos-acoes.md) · [serviços automáticos (frontend)](docs/frontend-servicos-automaticos.md) · [eventos](docs/events.md) · [segurança](docs/security.md) · [OpenAPI](api/openapi.yaml)
 
 ## Instalação
 
@@ -79,7 +79,10 @@ A resposta traz `csrf_token`; o cookie de sessão é definido automaticamente. E
    sudo ./deploy/install-agent.sh ./sentinela-agent https://SEU_SERVIDOR -    # pede o token sem eco
    journalctl -u sentinela-agent -f
    ```
-Detalhes e o que é coletado: [docs/agent.md](docs/agent.md).
+O `install-agent.sh` também instala a regra polkit (`deploy/50-sentinela-agent.rules`), que deixa o agente iniciar, parar e reiniciar **só** as unidades do catálogo (requer `polkitd`). Detalhes e o que é coletado: [docs/agent.md](docs/agent.md).
+
+### Iniciar, parar e reiniciar serviços
+Na aba Serviços de um servidor, `operator` e `admin` podem pedir `start`, `stop` ou `restart` de um serviço descoberto (`POST /api/v1/servers/{id}/services/{key}/actions`). O agente busca o pedido, executa `systemctl` e devolve o resultado; quem pediu fica gravado no comando e na auditoria (`service.*`). Só unidades systemd, e o SSH não pode ser parado. Containers Docker têm tela própria (`GET /api/v1/servers/{id}/docker`): lista todos, reinicia o ativo, inicia o inativo e mostra o erro e o fim do log de quem parou; exige `sudo ./deploy/update.sh --docker` (dá ao agente acesso ao socket do Docker, equivalente a root; veja [docs/agent.md](docs/agent.md)). Guia: [docs/frontend-docker.md](docs/frontend-docker.md). Guia do frontend: [docs/frontend-servicos-acoes.md](docs/frontend-servicos-acoes.md). Processos do servidor (CPU, memória, `GET /api/v1/servers/{id}/processes`) são listados pelo agente; encerrar um processo é restrito aos do mesmo usuário do agente (na instalação padrão, quase nenhum). Guia: [docs/frontend-processos.md](docs/frontend-processos.md). Em instalações existentes, rode `sudo ./deploy/update.sh` para instalar a regra polkit.
 
 ### Logs (nginx, fail2ban, firewall)
 O agente pode enviar os logs do nginx, do fail2ban e do ufw; ficam no ClickHouse (já incluído no compose), com retenção configurável e consulta em `GET /api/v1/logs`. Ative com `SENTINELA_LOGS=nginx,fail2ban,ufw` no agente. Detalhes em [docs/logs.md](docs/logs.md).

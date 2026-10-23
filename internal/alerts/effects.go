@@ -2,6 +2,7 @@ package alerts
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 
 	"sentinela/internal/events"
 	"sentinela/internal/notifications"
+	"sentinela/internal/procs"
 )
 
 // alertRow é o estado persistido de um alerta ativo.
@@ -38,6 +40,8 @@ type Target struct {
 	Value       float64
 	HasValue    bool // false = sem dados confiáveis agora (não avalia nem resolve)
 	Detail      string
+	// Culprits são os maiores consumidores de CPU/memória, preenchidos só na hora de disparar (veja Evaluator.culprits).
+	Culprits *procs.Culprits
 }
 
 func (t Target) key() string {
@@ -151,17 +155,26 @@ type incidentEvent struct {
 // tudo na transação do avaliador.
 func fire(ctx context.Context, tx pgx.Tx, rule Rule, t Target, existing *alertRow, now time.Time) error {
 	msg := Message(rule, t.Value, t.Detail)
+	var culprits []byte // jsonb; nulo quando não há consumidores a apontar
+	if c := t.Culprits; c != nil {
+		if txt := c.Text(); txt != "" {
+			msg += ". " + txt
+			if b, err := json.Marshal(c); err == nil {
+				culprits = b
+			}
+		}
+	}
 	var alertID string
 	if existing != nil {
 		alertID = existing.ID
 		if _, err := tx.Exec(ctx, `UPDATE alerts SET status = 'firing', triggered_at = $2, pending_since = NULL,
-				recovering_since = NULL, value = $3, message = $4, severity = $5, last_evaluated_at = $2 WHERE id = $1`,
-			alertID, now, t.Value, msg, rule.Severity); err != nil {
+				recovering_since = NULL, value = $3, message = $4, severity = $5, last_evaluated_at = $2, culprits = $6 WHERE id = $1`,
+			alertID, now, t.Value, msg, rule.Severity, culprits); err != nil {
 			return err
 		}
-	} else if err := tx.QueryRow(ctx, `INSERT INTO alerts (rule_id, server_id, service_id, status, severity, message, value, triggered_at, last_evaluated_at)
-		VALUES ($1,$2,$3,'firing',$4,$5,$6,$7,$7) RETURNING id`,
-		rule.ID, t.ServerID, t.ServiceID, rule.Severity, msg, t.Value, now).Scan(&alertID); err != nil {
+	} else if err := tx.QueryRow(ctx, `INSERT INTO alerts (rule_id, server_id, service_id, status, severity, message, value, triggered_at, last_evaluated_at, culprits)
+		VALUES ($1,$2,$3,'firing',$4,$5,$6,$7,$7,$8) RETURNING id`,
+		rule.ID, t.ServerID, t.ServiceID, rule.Severity, msg, t.Value, now, culprits).Scan(&alertID); err != nil {
 		return err
 	}
 	incID, recurrence, createdIncident, err := findOrCreateIncident(ctx, tx, rule, t, now)

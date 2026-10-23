@@ -45,6 +45,15 @@ As seis últimas linhas de cima (OOM em diante) vêm de **métricas de sistema g
 (tabela `system_metrics`, retenção `LOGS_RETENTION_DAYS`). Se o ClickHouse estiver fora do ar, esses alertas
 não abrem nem resolvem até o dado voltar.
 
+## Quem consumiu (processos)
+
+`cpu_high`, `load_high`, `memory_low`, `swap_high` e `oom_kill` anexam ao alerta os **3 maiores consumidores** (CPU ou memória, conforme a regra):
+o texto vai na mensagem do alerta, do incidente e da notificação, e o dado estruturado em `alerts.culprits` (veja [frontend-processos.md](frontend-processos.md)).
+O agente envia os processos a cada ~30 s (~10 s com CPU ou RAM acima de 85 %); a API grava no ClickHouse (`process_top`) os 5 maiores por CPU e por memória de cada leitura.
+Ao disparar, o avaliador calcula a média por nome de processo sobre a janela em que a condição valia (a duração da regra, de 2 a 15 min).
+Sem ClickHouse ou sem histórico, usa a última leitura de processos se tiver menos de 2 min; sem nada, o alerta dispara sem a lista (nunca atrasa nem falha por isso).
+O histórico também pode ser consultado direto: `GET /servers/{id}/processes/history`.
+
 ## Métricas de sistema (agente → ClickHouse)
 
 A cada minuto o agente lê `/proc/vmstat` (OOM), `/proc/diskstats` (latência), `statfs` (inodes),
