@@ -132,8 +132,18 @@ func (s *Store) Insert(ctx context.Context, serverID, batchID string, entries []
 	q.Set("query", "INSERT INTO "+s.table()+" FORMAT JSONEachRow")
 	q.Set("insert_deduplication_token", serverID+":"+batchID)
 	q.Set("date_time_input_format", "best_effort")
+	asyncInsert(q)
 	_, err := s.do(ctx, q, &buf)
 	return err
+}
+
+// asyncInsert pede ao ClickHouse que agrupe inserts pequenos e concorrentes em uma única parte.
+// wait_for_async_insert mantém a resposta só após a gravação (sem perda silenciosa) e
+// async_insert_deduplicate preserva a deduplicação por insert_deduplication_token.
+func asyncInsert(q url.Values) {
+	q.Set("async_insert", "1")
+	q.Set("wait_for_async_insert", "1")
+	q.Set("async_insert_deduplicate", "1")
 }
 
 // Ping verifica a conectividade.

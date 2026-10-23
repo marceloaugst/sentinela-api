@@ -54,6 +54,7 @@ func (s *Store) InsertSystem(ctx context.Context, serverID, batchID string, samp
 	q.Set("query", "INSERT INTO "+s.systemTable()+" FORMAT JSONEachRow")
 	q.Set("insert_deduplication_token", "sys:"+serverID+":"+batchID)
 	q.Set("date_time_input_format", "best_effort")
+	asyncInsert(q)
 	_, err := s.do(ctx, q, &buf)
 	return err
 }

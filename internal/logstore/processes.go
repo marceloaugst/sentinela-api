@@ -63,6 +63,7 @@ func (s *Store) InsertProcTop(ctx context.Context, serverID string, samples []pr
 	q.Set("query", "INSERT INTO "+s.procTable()+" FORMAT JSONEachRow")
 	q.Set("insert_deduplication_token", fmt.Sprintf("proc:%s:%d", serverID, samples[0].At.UnixMilli()))
 	q.Set("date_time_input_format", "best_effort")
+	asyncInsert(q)
 	_, err := s.do(ctx, q, &buf)
 	return err
 }
