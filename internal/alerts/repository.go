@@ -121,10 +121,12 @@ type Alert struct {
 	LastEvaluatedAt time.Time  `json:"last_evaluated_at"`
 	// Culprits são os maiores consumidores de CPU/memória quando o alerta disparou (nulo nas regras sem relação com processos).
 	Culprits json.RawMessage `json:"culprits"`
+	// Silenced: disparou durante um silenciamento/manutenção e a notificação externa ainda não foi enviada.
+	Silenced bool `json:"silenced"`
 }
 
 const alertSelect = `SELECT a.id, a.rule_id, r.name, a.server_id, s.name, a.service_id, ms.name, a.incident_id, a.status, r.priority, a.severity,
-		a.message, a.value, a.triggered_at, a.acknowledged_at, a.acknowledged_by::text, a.resolved_at, a.resolved_reason, a.last_evaluated_at, a.culprits
+		a.message, a.value, a.triggered_at, a.acknowledged_at, a.acknowledged_by::text, a.resolved_at, a.resolved_reason, a.last_evaluated_at, a.culprits, a.silenced
 	FROM alerts a JOIN alert_rules r ON r.id = a.rule_id JOIN servers s ON s.id = a.server_id
 	LEFT JOIN monitored_services ms ON ms.id = a.service_id`
 
@@ -132,7 +134,7 @@ func scanAlert(row pgx.Row) (Alert, error) {
 	var a Alert
 	err := row.Scan(&a.ID, &a.RuleID, &a.RuleName, &a.ServerID, &a.ServerName, &a.ServiceID, &a.ServiceName, &a.IncidentID,
 		&a.Status, &a.Priority, &a.Severity, &a.Message, &a.Value, &a.TriggeredAt, &a.AcknowledgedAt, &a.AcknowledgedBy, &a.ResolvedAt,
-		&a.ResolvedReason, &a.LastEvaluatedAt, &a.Culprits)
+		&a.ResolvedReason, &a.LastEvaluatedAt, &a.Culprits, &a.Silenced)
 	return a, err
 }
 
@@ -207,7 +209,7 @@ func (r *Repository) ListAlerts(ctx context.Context, p AlertListParams) ([]Alert
 }
 
 func lockAlert(ctx context.Context, tx pgx.Tx, id string) (alertRow, error) {
-	a, err := scanAlertRow(tx.QueryRow(ctx, `SELECT id, rule_id, server_id, service_id, incident_id, status, severity, message, pending_since, recovering_since
+	a, err := scanAlertRow(tx.QueryRow(ctx, `SELECT id, rule_id, server_id, service_id, incident_id, status, severity, message, pending_since, recovering_since, silenced
 		FROM alerts WHERE id = $1 AND status <> 'pending' FOR UPDATE`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return alertRow{}, ErrAlertNotFound

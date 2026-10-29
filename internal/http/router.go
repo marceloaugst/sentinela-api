@@ -23,6 +23,7 @@ import (
 	"sentinela/internal/http/middleware"
 	"sentinela/internal/http/response"
 	"sentinela/internal/incidents"
+	"sentinela/internal/ipintel"
 	"sentinela/internal/logstore"
 	"sentinela/internal/metrics"
 	"sentinela/internal/notifications"
@@ -32,6 +33,7 @@ import (
 	"sentinela/internal/secrets"
 	"sentinela/internal/servers"
 	"sentinela/internal/services"
+	"sentinela/internal/silences"
 	"sentinela/internal/svcactions"
 	"sentinela/internal/telemetry"
 	"sentinela/internal/users"
@@ -76,7 +78,9 @@ type Deps struct {
 	// Auth é opcional: se nil, é criado a partir da configuração.
 	Auth *auth.Service
 	// Logs é o armazenamento de logs (ClickHouse). Pode ser nil: as rotas respondem 503.
-	Logs     *logstore.Store
+	Logs *logstore.Store
+	// IPIntel enriquece IPs dos logs com país/provedor/reputação (AbuseIPDB). Pode ser nil.
+	IPIntel  *ipintel.Service
 	Registry *Registry
 	Version  string
 }
@@ -161,6 +165,7 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 	dockRepo := dockerhost.NewRepository(d.Pool)
 	procRepo := procs.NewRepository(d.Pool)
 	alertRepo := alerts.NewRepository(d.Pool)
+	silRepo := silences.NewRepository(d.Pool)
 	incRepo := incidents.NewRepository(d.Pool)
 	var box *secrets.Box
 	if cfg.SecretsKey != nil {
@@ -178,6 +183,7 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 	prh := handlers.Processes{Repo: procRepo, Actions: actRepo, Servers: srvRepo, Log: d.Log, TrustProxy: cfg.TrustProxy}
 	sah := handlers.ServiceActions{Repo: actRepo, Servers: srvRepo, Log: d.Log, TrustProxy: cfg.TrustProxy}
 	alh := handlers.Alerts{Repo: alertRepo, Log: d.Log, TrustProxy: cfg.TrustProxy}
+	slh := handlers.Silences{Repo: silRepo, Log: d.Log, TrustProxy: cfg.TrustProxy}
 	inh := handlers.Incidents{Repo: incRepo, Servers: srvRepo, Log: d.Log}
 	nth := handlers.Notifications{Store: notifications.NewStore(d.Pool), Log: d.Log, TrustProxy: cfg.TrustProxy}
 	chh := handlers.Channels{Repo: chRepo, Log: d.Log, TrustProxy: cfg.TrustProxy}
@@ -191,6 +197,9 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 	lgh := &handlers.Logs{Pool: d.Pool, Log: d.Log, Entries: d.Metrics.LogEntries}
 	if d.Logs != nil { // evita interface não-nil com ponteiro nil
 		lgh.Store = d.Logs
+	}
+	if d.IPIntel != nil {
+		lgh.Intel = d.IPIntel
 	}
 	smh := &handlers.SystemMetrics{Log: d.Log}
 	var procHist handlers.ProcHistoryStore
@@ -278,6 +287,12 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 		route("POST", "/alerts/{id}/acknowledge", O, alh.Acknowledge)
 		route("POST", "/alerts/{id}/resolve", O, alh.Resolve)
 
+		// silenciamentos e janelas de manutenção (suprimem a notificação externa; o alerta continua registrado)
+		route("GET", "/silences", V, slh.List)
+		route("POST", "/silences", O, slh.Create)
+		route("GET", "/silences/{id}", V, slh.Get)
+		route("DELETE", "/silences/{id}", O, slh.Cancel)
+
 		// notificações (registro permanente de alertas e IPs banidos)
 		route("GET", "/notifications", V, nth.List)
 		route("POST", "/notifications/read-all", O, nth.MarkAllRead)
@@ -299,6 +314,7 @@ func mountV1(r chi.Router, d Deps, authSvc *auth.Service) {
 		// logs (nginx, fail2ban, firewall)
 		route("GET", "/logs", V, lgh.List)
 		route("GET", "/logs/stats", V, lgh.Stats)
+		route("GET", "/logs/countries", V, lgh.Countries)
 
 		// dashboard
 		route("GET", "/dashboard/summary", V, dh.Summary)

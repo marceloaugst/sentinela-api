@@ -22,6 +22,7 @@ import (
 	"sentinela/internal/database"
 	"sentinela/internal/events"
 	apphttp "sentinela/internal/http"
+	"sentinela/internal/ipintel"
 	"sentinela/internal/logstore"
 	"sentinela/internal/notifications"
 	"sentinela/internal/retention"
@@ -183,6 +184,18 @@ func run(args []string) error {
 		log.Info("logs desativados (CLICKHOUSE_URL vazia)")
 	}
 
+	// Geolocalização/reputação de IPs (AbuseIPDB). Sem chave, só serve o que já está no cache.
+	ipIntel := ipintel.NewService(pool, &ipintel.Client{Key: cfg.AbuseIPDBKey, MaxAge: cfg.AbuseIPDBMaxAgeDays},
+		cfg.IPIntelCacheTTL, cfg.AbuseIPDBDailyLimit, log)
+	if cfg.AbuseIPDBKey == "" {
+		log.Info("AbuseIPDB sem chave (ABUSEIPDB_API_KEY): logs sem novas consultas de geolocalização")
+	}
+	spawn(func() {
+		scheduler.Loop(jobCtx, "ip_intel_purge", 6*time.Hour, metrics, log, func(c context.Context) error {
+			return ipintel.Purge(c, pool, 4*cfg.IPIntelCacheTTL, time.Now())
+		})
+	})
+
 	// Regras automáticas: grava o catálogo no PostgreSQL e arquiva qualquer regra fora dele.
 	if err := alerts.SyncCatalog(ctx, pool); err != nil {
 		return fmt.Errorf("sincronizar regras de alerta: %w", err)
@@ -198,7 +211,7 @@ func run(args []string) error {
 	srv := &nethttp.Server{
 		Addr: cfg.HTTPAddr,
 		Handler: apphttp.NewRouter(apphttp.Deps{
-			Config: cfg, Log: log, Metrics: metrics, DB: pool, Pool: pool, Hub: hub, Auth: authSvc, Logs: logStore, Version: version,
+			Config: cfg, Log: log, Metrics: metrics, DB: pool, Pool: pool, Hub: hub, Auth: authSvc, Logs: logStore, IPIntel: ipIntel, Version: version,
 		}),
 		ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout,
 		ReadTimeout:       cfg.HTTPReadTimeout,

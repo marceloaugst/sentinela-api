@@ -39,6 +39,17 @@ O agente lê os logs do servidor, normaliza cada linha e envia à API, que grava
 
 **Query string nunca é gravada** (costuma levar tokens): é removida de `path` e de `raw`.
 
+## Geolocalização dos IPs (AbuseIPDB)
+Guia para o frontend: [`frontend-geolocalizacao.md`](frontend-geolocalizacao.md). Também há `GET /logs/countries` (atividade por país).
+
+Com `ABUSEIPDB_API_KEY`, cada linha de `GET /logs` e cada item de `top_ips` em `GET /logs/stats` ganha `geo` (`country_code`, `isp`, `usage_type`, `domain`, `abuse_score` 0–100, `total_reports`, `is_tor`, `last_reported_at`). O AbuseIPDB informa o **país**, não coordenadas.
+
+- A consulta é feita **na leitura** (não na ingestão) e guardada no PostgreSQL (`ip_intel`) por `IP_INTEL_CACHE_HOURS` (168). Só IPs novos ou vencidos vão à rede.
+- IPs privados/loopback voltam com `geo.private: true` e não gastam cota.
+- Até 20 IPs novos por requisição (4 s no máximo); os demais aparecem nas próximas. Um IP sem `geo` significa "ainda não consultado", não "sem dados".
+- `ABUSEIPDB_DAILY_LIMIT` (1000, plano gratuito) é contado no banco; ao atingir, ou ao receber 429, a API para de consultar até 00:00 UTC e segue servindo o cache (mesmo vencido). Sem chave, só o cache é usado.
+- Falha de rede/5xx não derruba a listagem: o IP fica sem `geo` e não é repetido por 10 min.
+
 ## Garantias de entrega
 - O agente só avança a posição de leitura **depois que a API confirma** o lote. Reinício, queda da rede ou do ClickHouse não perdem linhas.
 - Entrega *at-least-once* com `batch_id`: o mesmo lote reenviado não duplica (a API responde `duplicate: true` e o ClickHouse deduplica por token).

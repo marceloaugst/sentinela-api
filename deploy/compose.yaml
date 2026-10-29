@@ -94,6 +94,10 @@ services:
       CLICKHOUSE_USER: sentinela
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       LOGS_RETENTION_DAYS: ${LOGS_RETENTION_DAYS:-90}
+      ABUSEIPDB_API_KEY: ${ABUSEIPDB_API_KEY:-}
+      ABUSEIPDB_DAILY_LIMIT: ${ABUSEIPDB_DAILY_LIMIT:-1000}
+      ABUSEIPDB_MAX_AGE_DAYS: ${ABUSEIPDB_MAX_AGE_DAYS:-90}
+      IP_INTEL_CACHE_HOURS: ${IP_INTEL_CACHE_HOURS:-168}
     ports:
       # Publicado apenas em loopback; exponha ao público via proxy reverso (Nginx) com HTTPS.
       - "127.0.0.1:${API_HOST_PORT:-8080}:8080"

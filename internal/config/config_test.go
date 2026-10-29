@@ -112,6 +112,23 @@ func TestLoadPhase5(t *testing.T) {
 	}
 }
 
+func TestLoadAbuseIPDB(t *testing.T) {
+	c, err := Load(env(map[string]string{"DATABASE_URL": "x"}))
+	if err != nil || c.AbuseIPDBKey != "" || c.AbuseIPDBDailyLimit != 1000 || c.AbuseIPDBMaxAgeDays != 90 || c.IPIntelCacheTTL != 168*time.Hour {
+		t.Fatalf("padrões: %+v, %v", c, err)
+	}
+	for name, m := range map[string]map[string]string{
+		"idade 0":   {"DATABASE_URL": "x", "ABUSEIPDB_MAX_AGE_DAYS": "0"},
+		"idade 400": {"DATABASE_URL": "x", "ABUSEIPDB_MAX_AGE_DAYS": "400"},
+		"cache 0":   {"DATABASE_URL": "x", "IP_INTEL_CACHE_HOURS": "0"},
+		"cota 0":    {"DATABASE_URL": "x", "ABUSEIPDB_DAILY_LIMIT": "0"},
+	} {
+		if _, err := Load(env(m)); err == nil {
+			t.Errorf("%s: esperava erro", name)
+		}
+	}
+}
+
 func TestLoadPhase6(t *testing.T) {
 	c, err := Load(env(map[string]string{"DATABASE_URL": "x"}))
 	if err != nil {
