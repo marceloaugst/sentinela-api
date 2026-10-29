@@ -85,6 +85,12 @@ type Config struct {
 	ClickHousePassword string
 	LogsRetentionDays  int
 
+	// AbuseIPDB (geolocalização e reputação de IPs nos logs). Chave vazia = só usa o cache.
+	AbuseIPDBKey        string
+	AbuseIPDBMaxAgeDays int           // janela dos relatórios na pontuação
+	IPIntelCacheTTL     time.Duration // validade de cada consulta guardada
+	AbuseIPDBDailyLimit int           // consultas por dia (plano gratuito: 1000)
+
 	AutoMigrate bool
 	LogLevel    string
 }
@@ -202,6 +208,10 @@ func Load(getenv func(string) string) (Config, error) {
 	c.ClickHouseUser = str("CLICKHOUSE_USER", "")
 	c.ClickHousePassword = getenv("CLICKHOUSE_PASSWORD")
 	c.LogsRetentionDays = integer("LOGS_RETENTION_DAYS", 90)
+	c.AbuseIPDBKey = str("ABUSEIPDB_API_KEY", "")
+	c.AbuseIPDBMaxAgeDays = integer("ABUSEIPDB_MAX_AGE_DAYS", 90)
+	c.IPIntelCacheTTL = time.Duration(integer("IP_INTEL_CACHE_HOURS", 168)) * time.Hour
+	c.AbuseIPDBDailyLimit = integer("ABUSEIPDB_DAILY_LIMIT", 1000)
 	for _, id := range strings.Split(getenv("TELEGRAM_ALLOWED_CHAT_IDS"), ",") {
 		if id = strings.TrimSpace(id); id != "" {
 			c.TelegramAllowedChatIDs = append(c.TelegramAllowedChatIDs, id)
@@ -238,6 +248,15 @@ func (c Config) validate() error {
 	}
 	if c.MetricsRetentionDays < 1 {
 		errs = append(errs, errors.New("METRICS_RETENTION_DAYS deve ser >= 1"))
+	}
+	if c.AbuseIPDBMaxAgeDays < 1 || c.AbuseIPDBMaxAgeDays > 365 {
+		errs = append(errs, errors.New("ABUSEIPDB_MAX_AGE_DAYS deve estar entre 1 e 365"))
+	}
+	if c.IPIntelCacheTTL < time.Hour {
+		errs = append(errs, errors.New("IP_INTEL_CACHE_HOURS deve ser >= 1"))
+	}
+	if c.AbuseIPDBDailyLimit < 1 {
+		errs = append(errs, errors.New("ABUSEIPDB_DAILY_LIMIT deve ser >= 1"))
 	}
 	if c.TelegramBotToken != "" && c.SecretsKey == nil {
 		errs = append(errs, errors.New("TELEGRAM_BOT_TOKEN exige SECRETS_KEY (o token é armazenado cifrado)"))

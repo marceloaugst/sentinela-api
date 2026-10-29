@@ -11,6 +11,7 @@ import (
 	"sentinela/internal/events"
 	"sentinela/internal/notifications"
 	"sentinela/internal/procs"
+	"sentinela/internal/silences"
 )
 
 // alertRow é o estado persistido de um alerta ativo.
@@ -25,6 +26,7 @@ type alertRow struct {
 	Message         string
 	PendingSince    *time.Time
 	RecoveringSince *time.Time
+	Silenced        bool
 }
 
 func (a alertRow) state() State {
@@ -164,17 +166,21 @@ func fire(ctx context.Context, tx pgx.Tx, rule Rule, t Target, existing *alertRo
 			}
 		}
 	}
+	silence, err := silences.ActiveFor(ctx, tx, t.ServerID, rule.ID, now)
+	if err != nil {
+		return err
+	}
 	var alertID string
 	if existing != nil {
 		alertID = existing.ID
 		if _, err := tx.Exec(ctx, `UPDATE alerts SET status = 'firing', triggered_at = $2, pending_since = NULL,
-				recovering_since = NULL, value = $3, message = $4, severity = $5, last_evaluated_at = $2, culprits = $6 WHERE id = $1`,
-			alertID, now, t.Value, msg, rule.Severity, culprits); err != nil {
+				recovering_since = NULL, value = $3, message = $4, severity = $5, last_evaluated_at = $2, culprits = $6, silenced = $7 WHERE id = $1`,
+			alertID, now, t.Value, msg, rule.Severity, culprits, silence != nil); err != nil {
 			return err
 		}
-	} else if err := tx.QueryRow(ctx, `INSERT INTO alerts (rule_id, server_id, service_id, status, severity, message, value, triggered_at, last_evaluated_at, culprits)
-		VALUES ($1,$2,$3,'firing',$4,$5,$6,$7,$7,$8) RETURNING id`,
-		rule.ID, t.ServerID, t.ServiceID, rule.Severity, msg, t.Value, now, culprits).Scan(&alertID); err != nil {
+	} else if err := tx.QueryRow(ctx, `INSERT INTO alerts (rule_id, server_id, service_id, status, severity, message, value, triggered_at, last_evaluated_at, culprits, silenced)
+		VALUES ($1,$2,$3,'firing',$4,$5,$6,$7,$7,$8,$9) RETURNING id`,
+		rule.ID, t.ServerID, t.ServiceID, rule.Severity, msg, t.Value, now, culprits, silence != nil).Scan(&alertID); err != nil {
 		return err
 	}
 	incID, recurrence, createdIncident, err := findOrCreateIncident(ctx, tx, rule, t, now)
@@ -187,11 +193,18 @@ func fire(ctx context.Context, tx pgx.Tx, rule Rule, t Target, existing *alertRo
 	if err := addEvent(ctx, tx, incID, "alert_triggered", msg, now); err != nil {
 		return err
 	}
-	if err := notifications.EnqueueAlert(ctx, tx, notifications.Payload{
+	pl := notifications.Payload{
 		Kind: notifications.KindTriggered, ServerID: t.ServerID, AlertID: alertID, IncidentID: incID,
 		ServerName: t.ServerName, ServiceName: t.ServiceName, RuleName: rule.Name,
 		Severity: rule.Severity, Priority: priorityOf(rule), Recurrence: recurrence, Message: msg, At: now,
-	}); err != nil {
+	}
+	if silence != nil {
+		pl.Silenced, pl.SilenceReason = true, silence.Reason
+		if err := addEvent(ctx, tx, incID, "silenced", "Notificação silenciada: "+silence.Reason, now); err != nil {
+			return err
+		}
+	}
+	if err := notifications.EnqueueAlert(ctx, tx, pl); err != nil {
 		return err
 	}
 	// Eventos por ÚLTIMO (ver events.Publish): incidente primeiro, depois o alerta.
@@ -208,6 +221,29 @@ func fire(ctx context.Context, tx pgx.Tx, rule Rule, t Target, existing *alertRo
 		AlertID: alertID, IncidentID: incID, ServerID: t.ServerID, ServerName: t.ServerName, ServiceID: t.ServiceID,
 		ServiceName: t.ServiceName, RuleID: rule.ID, RuleName: rule.Name, Severity: rule.Severity,
 		Status: StatusFiring, Message: msg, At: now,
+	})
+}
+
+// releaseSilenced envia a notificação de um alerta que disparou durante um silenciamento, assim que nenhuma janela o cobre mais
+// e ele continua aberto. Reconhecido (alguém já sabe) só limpa a marca. Chamado a cada avaliação de alertas marcados.
+func releaseSilenced(ctx context.Context, tx pgx.Tx, rule Rule, t Target, a alertRow, now time.Time) error {
+	s, err := silences.ActiveFor(ctx, tx, a.ServerID, a.RuleID, now)
+	if err != nil || s != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE alerts SET silenced = false WHERE id = $1`, a.ID); err != nil {
+		return err
+	}
+	if a.Status != StatusFiring || a.IncidentID == nil {
+		return nil
+	}
+	if err := addEvent(ctx, tx, *a.IncidentID, "silence_ended", "Silenciamento encerrado com o alerta ainda aberto; notificação enviada", now); err != nil {
+		return err
+	}
+	return notifications.EnqueueAlert(ctx, tx, notifications.Payload{
+		Kind: notifications.KindTriggered, ServerID: a.ServerID, AlertID: a.ID, IncidentID: *a.IncidentID,
+		ServerName: t.ServerName, ServiceName: t.ServiceName, RuleName: rule.Name,
+		Severity: a.Severity, Priority: priorityOf(rule), Message: a.Message + " (silenciamento encerrado; o problema continua)", At: now,
 	})
 }
 

@@ -13,6 +13,7 @@ import (
 
 	"sentinela/internal/events"
 	"sentinela/internal/http/response"
+	"sentinela/internal/ipintel"
 	"sentinela/internal/logs"
 	"sentinela/internal/logstore"
 	"sentinela/internal/notifications"
@@ -34,10 +35,17 @@ type LogStore interface {
 	Insert(ctx context.Context, serverID, batchID string, entries []logs.Entry) error
 	List(ctx context.Context, f logstore.Filter, page, perPage int) ([]logstore.Row, int, error)
 	Stats(ctx context.Context, f logstore.Filter) (logstore.Stats, error)
+	IPTotals(ctx context.Context, f logstore.Filter, metric string, limit int) ([]logstore.IPTotal, int64, error)
+}
+
+// IPIntel enriquece IPs com país, provedor e reputação. Opcional.
+type IPIntel interface {
+	Lookup(ctx context.Context, ips []string) map[string]ipintel.Info
 }
 
 type Logs struct {
 	Store LogStore // nil = recurso desativado (CLICKHOUSE_URL vazia)
+	Intel IPIntel  // nil = respostas sem "geo"
 	Pool  *pgxpool.Pool
 	Log   *slog.Logger
 	// Entries conta entradas por resultado (stored|duplicate|error); opcional.
@@ -231,7 +239,7 @@ func (h *Logs) List(w http.ResponseWriter, r *http.Request) {
 		response.Internal(w)
 		return
 	}
-	response.JSON(w, http.StatusOK, rows, newPageMeta(page, per, total))
+	response.JSON(w, http.StatusOK, h.withGeo(r.Context(), rows), newPageMeta(page, per, total))
 }
 
 func (h *Logs) Stats(w http.ResponseWriter, r *http.Request) {
@@ -250,7 +258,64 @@ func (h *Logs) Stats(w http.ResponseWriter, r *http.Request) {
 		response.Internal(w)
 		return
 	}
-	response.JSON(w, http.StatusOK, st, nil)
+	response.JSON(w, http.StatusOK, h.statsWithGeo(r.Context(), st), nil)
+}
+
+type logRowOut struct {
+	logstore.Row
+	Geo *ipintel.Info `json:"geo,omitempty"`
+}
+
+type ipCountOut struct {
+	logstore.IPCount
+	Geo *ipintel.Info `json:"geo,omitempty"`
+}
+
+// statsOut sobrepõe top_ips de logstore.Stats (o campo mais raso vence na serialização).
+type statsOut struct {
+	logstore.Stats
+	TopIPs []ipCountOut `json:"top_ips"`
+}
+
+func (h *Logs) geo(ctx context.Context, ips []string) map[string]ipintel.Info {
+	if h.Intel == nil || len(ips) == 0 {
+		return nil
+	}
+	return h.Intel.Lookup(ctx, ips)
+}
+
+func (h *Logs) withGeo(ctx context.Context, rows []logstore.Row) []logRowOut {
+	var ips []string
+	for _, r := range rows {
+		if r.IP != "" {
+			ips = append(ips, r.IP)
+		}
+	}
+	info := h.geo(ctx, ips)
+	out := make([]logRowOut, len(rows))
+	for i, r := range rows {
+		out[i].Row = r
+		if in, ok := info[r.IP]; ok {
+			out[i].Geo = &in
+		}
+	}
+	return out
+}
+
+func (h *Logs) statsWithGeo(ctx context.Context, st logstore.Stats) statsOut {
+	ips := make([]string, 0, len(st.TopIPs))
+	for _, c := range st.TopIPs {
+		ips = append(ips, c.IP)
+	}
+	info := h.geo(ctx, ips)
+	out := statsOut{Stats: st, TopIPs: make([]ipCountOut, len(st.TopIPs))}
+	for i, c := range st.TopIPs {
+		out.TopIPs[i].IPCount = c
+		if in, ok := info[c.IP]; ok {
+			out.TopIPs[i].Geo = &in
+		}
+	}
+	return out
 }
 
 // recentBatches lembra lotes recentes para responder reenvios sem gravar (nem anunciar) de novo.

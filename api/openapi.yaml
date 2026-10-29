@@ -20,6 +20,7 @@ tags:
   - name: dashboard
   - name: services
   - name: alerts
+  - name: silences
   - name: incidents
   - name: notifications
   - name: events
@@ -422,6 +423,56 @@ paths:
         "429": { $ref: "#/components/responses/RateLimited" }
         "503": { $ref: "#/components/responses/LogsUnavailable" }
 
+  /api/v1/logs/countries:
+    get:
+      tags: [logs]
+      summary: Atividade dos logs agrupada por país de origem (AbuseIPDB)
+      description: |
+        Agrupa por IP no ClickHouse (os 1000 mais ativos) e traduz para país pelo cache do AbuseIPDB. Chaves em camelCase.
+        `countries[].events` conta a `metric` escolhida; `ips` é o número de IPs distintos e `avgScore` a média (por IP) do `abuse_score`.
+        `unknown` reúne IPs privados, ainda não consultados (a consulta é gradual, 20 por requisição) e os fora dos 1000 mais ativos;
+        `total` = soma de `countries[].events` + `unknown.events`.
+      operationId: logsByCountry
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - { name: days, in: query, schema: { type: integer, minimum: 1, maximum: 31, default: 7 } }
+        - { name: metric, in: query, description: "events (padrão), bans, blocks (firewall) ou http_errors", schema: { type: string, enum: [events, bans, blocks, http_errors] } }
+        - { name: server_id, in: query, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Totais por país
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      generatedAt: { type: string, format: date-time }
+                      periodDays: { type: integer }
+                      metric: { type: string }
+                      total: { type: integer }
+                      countries:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            code: { type: string, example: BR }
+                            name: { type: string, example: Brazil }
+                            events: { type: integer }
+                            ips: { type: integer }
+                            avgScore: { type: integer, minimum: 0, maximum: 100 }
+                      unknown:
+                        type: object
+                        properties: { events: { type: integer }, ips: { type: integer } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/Validation" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/LogsUnavailable" }
   /api/v1/audit-logs:
     get:
       tags: [users]
@@ -1471,6 +1522,124 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { description: Alerta já resolvido (INVALID_STATE), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
 
+  /api/v1/silences:
+    get:
+      tags: [silences]
+      summary: Lista silenciamentos e janelas de manutenção (mais recentes primeiro)
+      description: |
+        `status`: `active` (valendo agora), `scheduled` (começa no futuro) ou `ended` (expirado ou cancelado). Sem `status`, todos.
+        Com `server_id`, inclui também as janelas que valem para todos os servidores.
+      operationId: listSilences
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: per_page, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: status, in: query, schema: { type: string, enum: [active, scheduled, ended] } }
+        - { name: server_id, in: query, schema: { type: string, format: uuid } }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Página de silenciamentos
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Silence" } }
+                  meta: { $ref: "#/components/schemas/PageMeta" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Validation" }
+    post:
+      tags: [silences]
+      summary: Cria um silenciamento ou uma janela de manutenção
+      description: |
+        Enquanto a janela vale, os alertas que casam com o escopo (`server_id` e/ou `rule_id`; omitido = todos) continuam sendo
+        avaliados, registrados e abrem incidente, mas **não geram notificação externa** (Telegram). Ficam com `silenced: true`
+        e uma nota "Notificação silenciada" na linha do tempo do incidente. Se o alerta continuar aberto quando a janela terminar
+        (ou for cancelada), a notificação é enviada nesse momento. A recuperação de um alerta cujo disparo foi silenciado não é enviada.
+
+        Informe `ends_at` **ou** `duration_minutes`. `starts_at` é opcional (padrão: agora) e pode ser futuro (até 90 dias), o que
+        agenda uma manutenção. Duração máxima: 30 dias. `kind` é só um rótulo: `silence` (padrão) ou `maintenance`.
+      operationId: createSilence
+      x-required-role: operator
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                kind: { type: string, enum: [silence, maintenance], default: silence }
+                reason: { type: string, minLength: 1, maxLength: 300 }
+                server_id: { type: string, format: uuid, nullable: true }
+                rule_id: { type: string, format: uuid, nullable: true }
+                starts_at: { type: string, format: date-time }
+                ends_at: { type: string, format: date-time }
+                duration_minutes: { type: integer, minimum: 1, maximum: 43200 }
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "201":
+          description: Silenciamento criado
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Silence" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Validation" }
+  /api/v1/silences/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [silences]
+      summary: Detalha um silenciamento
+      operationId: getSilence
+      x-required-role: viewer
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Silenciamento
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Silence" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [silences]
+      summary: Encerra o silenciamento agora (ou descarta o agendado)
+      description: Idempotente. Já expirado ou cancelado devolve o registro como está. Alertas ainda abertos e silenciados notificam na próxima avaliação.
+      operationId: cancelSilence
+      x-required-role: operator
+      security: [{ sessionAuth: [] }, { adminKey: [] }]
+      responses:
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "200":
+          description: Silenciamento com status `cancelled`
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Silence" }
+        "400": { $ref: "#/components/responses/InvalidId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
   /api/v1/notifications:
     get:
       tags: [notifications]
@@ -2778,6 +2947,24 @@ components:
         resolved_reason: { type: string, nullable: true, enum: [recovered, manual, rule_disabled, rule_deleted, out_of_scope] }
         last_evaluated_at: { type: string, format: date-time }
         culprits: { $ref: "#/components/schemas/AlertCulprits" }
+        silenced: { type: boolean, description: "Disparou durante um silenciamento/manutenção e a notificação externa ainda não foi enviada" }
+    Silence:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [silence, maintenance] }
+        status: { type: string, enum: [active, scheduled, expired, cancelled], description: Calculado no momento da consulta }
+        reason: { type: string }
+        server_id: { type: string, format: uuid, nullable: true, description: Nulo = todos os servidores }
+        server_name: { type: string, nullable: true }
+        rule_id: { type: string, format: uuid, nullable: true, description: Nulo = todas as regras }
+        rule_name: { type: string, nullable: true }
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+        created_by: { type: string, description: E-mail do usuário ou `api_key` }
+        created_at: { type: string, format: date-time }
+        cancelled_at: { type: string, format: date-time, nullable: true }
+        cancelled_by: { type: string, nullable: true }
     AlertCulprits:
       type: object
       nullable: true
@@ -2916,6 +3103,24 @@ components:
         - type: object
           properties:
             server_id: { type: string, format: uuid }
+            geo: { $ref: "#/components/schemas/IPGeo" }
+    IPGeo:
+      type: object
+      description: |
+        País, provedor e reputação do IP segundo o AbuseIPDB (cache de `IP_INTEL_CACHE_HOURS`). Ausente quando o IP ainda não foi
+        consultado (sem `ABUSEIPDB_API_KEY`, cota diária esgotada ou consulta nova em andamento: aparece nas próximas requisições).
+        `private: true` para IPs de rede interna/loopback (nada é consultado). O AbuseIPDB não fornece coordenadas. Texto de terceiros: exiba como texto.
+      properties:
+        private: { type: boolean }
+        country_code: { type: string, example: CN, description: ISO 3166-1 alfa-2 }
+        isp: { type: string }
+        usage_type: { type: string, example: Data Center/Web Hosting/Transit }
+        domain: { type: string }
+        abuse_score: { type: integer, minimum: 0, maximum: 100, description: Confiança de abuso do AbuseIPDB }
+        total_reports: { type: integer }
+        is_tor: { type: boolean }
+        last_reported_at: { type: string, format: date-time }
+        fetched_at: { type: string, format: date-time }
     LogStats:
       type: object
       properties:
@@ -2935,6 +3140,7 @@ components:
               bans: { type: integer }
               firewall_blocks: { type: integer }
               http_errors: { type: integer }
+              geo: { $ref: "#/components/schemas/IPGeo" }
         top_blocked_ports:
           type: array
           items: { type: object, properties: { port: { type: integer }, blocks: { type: integer } } }

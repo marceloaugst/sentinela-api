@@ -277,13 +277,13 @@ func (e *Evaluator) targets(rule Rule, snap snapshot, now time.Time) []Target {
 	return out
 }
 
-const activeAlertsSQL = `SELECT id, rule_id, server_id, service_id, incident_id, status, severity, message, pending_since, recovering_since
+const activeAlertsSQL = `SELECT id, rule_id, server_id, service_id, incident_id, status, severity, message, pending_since, recovering_since, silenced
 	FROM alerts WHERE status IN ('pending','firing','acknowledged')`
 
 func scanAlertRow(row pgx.Row) (alertRow, error) {
 	var a alertRow
 	err := row.Scan(&a.ID, &a.RuleID, &a.ServerID, &a.ServiceID, &a.IncidentID, &a.Status, &a.Severity, &a.Message,
-		&a.PendingSince, &a.RecoveringSince)
+		&a.PendingSince, &a.RecoveringSince, &a.Silenced)
 	return a, err
 }
 
@@ -428,8 +428,12 @@ func (e *Evaluator) apply(ctx context.Context, tx pgx.Tx, rule Rule, t Target, c
 	switch act {
 	case ActNone:
 		if has { // atualiza o valor observado e o instante da última avaliação
-			_, err := tx.Exec(ctx, `UPDATE alerts SET value = $2, last_evaluated_at = $3 WHERE id = $1`, cur.ID, t.Value, now)
-			return err
+			if _, err := tx.Exec(ctx, `UPDATE alerts SET value = $2, last_evaluated_at = $3 WHERE id = $1`, cur.ID, t.Value, now); err != nil {
+				return err
+			}
+			if cur.Silenced {
+				return releaseSilenced(ctx, tx, rule, t, cur, now)
+			}
 		}
 	case ActStartPending:
 		_, err := tx.Exec(ctx, `INSERT INTO alerts (rule_id, server_id, service_id, status, severity, message, value, pending_since, triggered_at, last_evaluated_at)

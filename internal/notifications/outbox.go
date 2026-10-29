@@ -37,6 +37,9 @@ type Payload struct {
 	Recurrence  int       `json:"recurrence,omitempty"` // incidentes anteriores iguais nas últimas 24 h
 	Message     string    `json:"message"`
 	At          time.Time `json:"at"`
+	// Silenced: o alerta caiu numa janela de silenciamento/manutenção. Fica no registro do painel, mas não vai aos canais.
+	Silenced      bool   `json:"silenced,omitempty"`
+	SilenceReason string `json:"silence_reason,omitempty"`
 }
 
 func DedupKey(alertID, kind string) string { return "alert:" + alertID + ":" + kind }
@@ -47,6 +50,9 @@ func DedupKey(alertID, kind string) string { return "alert:" + alertID + ":" + k
 func EnqueueAlert(ctx context.Context, tx pgx.Tx, p Payload) error {
 	if err := Record(ctx, tx, p); err != nil {
 		return err
+	}
+	if p.Silenced {
+		return nil
 	}
 	return enqueue(ctx, tx, p, DedupKey(p.AlertID, p.Kind))
 }

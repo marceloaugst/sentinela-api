@@ -259,3 +259,59 @@ func (s *Store) Stats(ctx context.Context, f Filter) (Stats, error) {
 	}
 	return st, nil
 }
+
+// Metrics aceitas por IPTotals; o valor é a condição SQL (constante, nunca vem do usuário).
+var metricConds = map[string]string{
+	"events":      "type NOT IN ('access_summary', 'unban', 'allow')",
+	"bans":        "type = 'ban'",
+	"blocks":      "source = 'firewall' AND type != 'allow'",
+	"http_errors": "source = 'nginx' AND status >= 400",
+}
+
+// ValidMetric informa se m é uma métrica conhecida de IPTotals.
+func ValidMetric(m string) bool { _, ok := metricConds[m]; return ok }
+
+// IPTotal é a contagem da métrica para um IP.
+type IPTotal struct {
+	IP    string `json:"ip"`
+	Count int64  `json:"count"`
+}
+
+// IPTotals devolve os limit IPs com mais ocorrências da métrica no período, e o total da métrica
+// (incluindo IPs fora do limite, mas só eventos com IP).
+func (s *Store) IPTotals(ctx context.Context, f Filter, metric string, limit int) ([]IPTotal, int64, error) {
+	cond, ok := metricConds[metric]
+	if !ok {
+		return nil, 0, fmt.Errorf("logstore: métrica desconhecida %q", metric)
+	}
+	where, p := f.where()
+	where += " AND ip != '' AND " + cond
+	p["limit"] = strconv.Itoa(limit)
+	raw, err := s.query(ctx, `SELECT ip, count() AS count FROM `+s.table()+` WHERE `+where+
+		` GROUP BY ip ORDER BY count DESC LIMIT {limit:UInt32} FORMAT JSONEachRow`, p)
+	if err != nil {
+		return nil, 0, err
+	}
+	var ips []IPTotal
+	if err := eachRow(raw, func(l []byte) error {
+		var r IPTotal
+		if err := json.Unmarshal(l, &r); err != nil {
+			return err
+		}
+		ips = append(ips, r)
+		return nil
+	}); err != nil {
+		return nil, 0, err
+	}
+	raw, err = s.query(ctx, `SELECT count() AS n FROM `+s.table()+` WHERE `+where+` FORMAT JSONEachRow`, p)
+	if err != nil {
+		return nil, 0, err
+	}
+	var t struct {
+		N int64 `json:"n"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &t); err != nil {
+		return nil, 0, fmt.Errorf("clickhouse: resposta inválida: %w", err)
+	}
+	return ips, t.N, nil
+}
