@@ -219,7 +219,9 @@ type ListParams struct {
 
 func (r *Repository) List(ctx context.Context, p ListParams) ([]Silence, int, error) {
 	now := r.now()
-	where := []string{"true"}
+	// $1 (agora) precisa aparecer na consulta de contagem mesmo sem filtro de status: o PostgreSQL recusa um parâmetro
+	// que a consulta não referencia ("could not determine data type of parameter $1"), o que dava 500 sem ?status=.
+	where := []string{"$1::timestamptz IS NOT NULL"}
 	args := []any{now}
 	switch p.Status {
 	case StatusActive:

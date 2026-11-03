@@ -1,28 +1,32 @@
 // /etc/polkit-1/rules.d/50-sentinela-agent.rules
 // Permite que o agente do Sentinela (usuário dinâmico "sentinela-agent", sem privilégios) inicie, pare e reinicie
 // SOMENTE as unidades abaixo — as mesmas do catálogo de descoberta (internal/discovery). Qualquer outra
-// unidade ou verbo (enable, mask, kill, daemon-reload...) continua negada. Mantenha esta lista igual à do catálogo.
+// unidade ou verbo (enable, mask, kill, daemon-reload...) continua negada. Mantenha esta lista igual à do catálogo
+// e os verbos iguais aos de internal/svcactions (controllable).
 polkit.addRule(function (action, subject) {
     if (action.id !== "org.freedesktop.systemd1.manage-units" || subject.user !== "sentinela-agent") {
         return polkit.Result.NOT_HANDLED;
     }
     var verb = action.lookup("verb");
-    if (verb !== "start" && verb !== "stop" && verb !== "restart") {
-        return polkit.Result.NOT_HANDLED;
-    }
     var unit = action.lookup("unit") || "";
+    var all = ["start", "stop", "restart"];
     var allowed = [
-        /^ssh\.service$/, /^sshd\.service$/,
-        /^cron\.service$/, /^crond\.service$/,
-        /^systemd-timesyncd\.service$/,
-        /^rsyslog\.service$/,
-        /^nginx\.service$/,
-        /^redis-server\.service$/, /^redis\.service$/, /^redis@[A-Za-z0-9:_.-]+\.service$/,
-        /^docker\.service$/,
-        /^postgresql\.service$/, /^postgresql@[A-Za-z0-9:_.-]+\.service$/
+        // SSH: nunca "stop" (trancaria o administrador fora do servidor), mesmo que a API ou o agente sejam comprometidos.
+        { re: /^ssh\.service$/, verbs: ["start", "restart"] }, { re: /^sshd\.service$/, verbs: ["start", "restart"] },
+        { re: /^cron\.service$/, verbs: all }, { re: /^crond\.service$/, verbs: all },
+        { re: /^systemd-timesyncd\.service$/, verbs: all },
+        { re: /^rsyslog\.service$/, verbs: all },
+        { re: /^nginx\.service$/, verbs: all },
+        { re: /^redis-server\.service$/, verbs: all }, { re: /^redis\.service$/, verbs: all },
+        { re: /^redis@[A-Za-z0-9:_.-]+\.service$/, verbs: all },
+        { re: /^docker\.service$/, verbs: all },
+        { re: /^postgresql\.service$/, verbs: all }, { re: /^postgresql@[A-Za-z0-9:_.-]+\.service$/, verbs: all }
     ];
     for (var i = 0; i < allowed.length; i++) {
-        if (allowed[i].test(unit)) {
+        if (allowed[i].re.test(unit)) {
+            if (allowed[i].verbs.indexOf(verb) < 0) {
+                return polkit.Result.NOT_HANDLED;
+            }
             polkit.log("sentinela-agent: " + verb + " " + unit);
             return polkit.Result.YES;
         }

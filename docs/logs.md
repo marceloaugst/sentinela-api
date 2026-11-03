@@ -45,8 +45,9 @@ Guia para o frontend: [`frontend-geolocalizacao.md`](frontend-geolocalizacao.md)
 Com `ABUSEIPDB_API_KEY`, cada linha de `GET /logs` e cada item de `top_ips` em `GET /logs/stats` ganha `geo` (`country_code`, `isp`, `usage_type`, `domain`, `abuse_score` 0–100, `total_reports`, `is_tor`, `last_reported_at`). O AbuseIPDB informa o **país**, não coordenadas.
 
 - A consulta é feita **na leitura** (não na ingestão) e guardada no PostgreSQL (`ip_intel`) por `IP_INTEL_CACHE_HOURS` (168). Só IPs novos ou vencidos vão à rede.
-- IPs privados/loopback voltam com `geo.private: true` e não gastam cota.
+- IPs que não são públicos voltam com `geo.private: true` e não gastam cota nem são enviados ao AbuseIPDB: privados, loopback, link-local, multicast e faixas reservadas (CGNAT `100.64.0.0/10`, documentação, testes de desempenho `198.18.0.0/15`, `240.0.0.0/4`, e as equivalentes de IPv6). Texto que não é IP é ignorado.
 - Até 20 IPs novos por requisição (4 s no máximo); os demais aparecem nas próximas. Um IP sem `geo` significa "ainda não consultado", não "sem dados".
+- `ABUSEIPDB_HOURLY_LIMIT` limita as consultas por **hora**, por instância (padrão 0 = automático: 1/12 da cota diária, 83 para 1000, no mínimo 10). Sem ele, algumas dezenas de telas de logs, ou um agente comprometido inventando IPs, esgotariam a cota do dia; ao atingir, os IPs novos ficam sem `geo` até o teto encher de novo (1 hora) e há um aviso no log.
 - `ABUSEIPDB_DAILY_LIMIT` (1000, plano gratuito) é contado no banco; ao atingir, ou ao receber 429, a API para de consultar até 00:00 UTC e segue servindo o cache (mesmo vencido). Sem chave, só o cache é usado.
 - Falha de rede/5xx não derruba a listagem: o IP fica sem `geo` e não é repetido por 10 min.
 

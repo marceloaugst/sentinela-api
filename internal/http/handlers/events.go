@@ -76,7 +76,7 @@ func (h Events) Stream(w http.ResponseWriter, r *http.Request) {
 	rc := http.NewResponseController(w)
 
 	// Inscreve ANTES de ler o histórico: nenhum evento cai na fresta entre o replay e o ao vivo.
-	sub, err := h.Hub.Subscribe(netutil.ClientIP(r, h.TrustProxy), filter)
+	sub, err := h.Hub.Subscribe(netutil.LimitKey(netutil.ClientIP(r, h.TrustProxy)), filter)
 	switch {
 	case errors.Is(err, events.ErrTooManyPerIP):
 		w.Header().Set("Retry-After", "10")

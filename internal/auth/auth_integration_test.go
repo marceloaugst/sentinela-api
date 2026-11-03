@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -235,6 +236,86 @@ func TestIPAndEmailWideLockouts(t *testing.T) {
 	}
 	if _, err := h.login("fantasma@exemplo.com", pw, "203.0.113.9"); func() bool { _, ok := isLocked(err); return !ok }() {
 		t.Errorf("e-mail inexistente deve bloquear igual a um existente: %v", err)
+	}
+}
+
+// Requisições simultâneas não podem furar o limite: a tentativa é reservada ANTES do hash (lento) da senha.
+func TestConcurrentFailuresCannotExceedTheLockoutLimit(t *testing.T) {
+	const workers = 40
+	run := func(name string, email func(i int) string, ip func(i int) string, wantMax int, countSQL string) {
+		f := newFx(t)
+		f.user("vitima@exemplo.com", users.RoleViewer)
+		var wg sync.WaitGroup
+		var locked, invalid atomic.Int32
+		start := make(chan struct{})
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				_, err := f.login(email(i), "chute-chute-chute-1", ip(i))
+				if _, ok := isLocked(err); ok {
+					locked.Add(1)
+				} else if errors.Is(err, auth.ErrInvalidCredentials) {
+					invalid.Add(1)
+				} else {
+					t.Errorf("%s: erro inesperado: %v", name, err)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		if n := f.count(countSQL); n != wantMax {
+			t.Errorf("%s: %d tentativas gravadas; o limite é %d", name, n, wantMax)
+		}
+		if int(invalid.Load()) != wantMax || int(locked.Load()) != workers-wantMax {
+			t.Errorf("%s: %d senhas erradas e %d bloqueios; esperado %d e %d", name, invalid.Load(), locked.Load(), wantMax, workers-wantMax)
+		}
+	}
+	// par (e-mail, IP): 5
+	run("par", func(int) string { return "vitima@exemplo.com" }, func(int) string { return "203.0.113.5" }, 5, `SELECT count(*) FROM login_attempts`)
+	// origem (muitos e-mails, mesmo IP): 20
+	run("origem", func(i int) string { return fmt.Sprintf("alvo%d@exemplo.com", i) }, func(int) string { return "203.0.113.6" }, 20, `SELECT count(*) FROM login_attempts`)
+	// e-mail em IPs distintos: 30
+	run("e-mail", func(int) string { return "vitima@exemplo.com" }, func(i int) string { return fmt.Sprintf("198.51.100.%d", i+1) }, 30, `SELECT count(*) FROM login_attempts`)
+}
+
+// Quem tem um /64 de IPv6 troca de endereço a cada tentativa: os escopos por IP contam a rede /64 inteira.
+func TestIPv6LockoutsCountTheWhole64(t *testing.T) {
+	// par (e-mail, origem): 5 falhas, cada uma de um endereço diferente do mesmo /64
+	f := newFx(t)
+	f.user("vitima@exemplo.com", users.RoleViewer)
+	for i := 0; i < 5; i++ {
+		f.login("vitima@exemplo.com", "chute-chute-chute-1", fmt.Sprintf("2001:db8:aa:1:%x::%x", i+1, i+7))
+	}
+	if _, err := f.login("vitima@exemplo.com", pw, "2001:db8:aa:1:ffff::1"); func() bool { _, ok := isLocked(err); return !ok }() {
+		t.Errorf("5 falhas no mesmo /64 deveriam bloquear o par: %v", err)
+	}
+	if _, err := f.login("vitima@exemplo.com", pw, "2001:db8:aa:2::1"); err != nil {
+		t.Errorf("outro /64 não é afetado: %v", err)
+	}
+	if n := f.count(`SELECT count(DISTINCT ip) FROM login_attempts WHERE NOT succeeded`); n != 5 {
+		t.Errorf("cada tentativa guarda o endereço exato (auditoria): %d endereços distintos", n)
+	}
+
+	// origem: credential stuffing girando endereços dentro do /64
+	g := newFx(t)
+	g.user("real@exemplo.com", users.RoleViewer)
+	for i := 0; i < 20; i++ {
+		g.login(fmt.Sprintf("alvo%d@exemplo.com", i), "chute-chute-chute-1", fmt.Sprintf("2001:db8:bb:1::%x", i+1))
+	}
+	if _, err := g.login("real@exemplo.com", pw, "2001:db8:bb:1::beef"); func() bool { _, ok := isLocked(err); return !ok }() {
+		t.Errorf("20 falhas no mesmo /64 deveriam bloquear a origem: %v", err)
+	}
+
+	// IPv4 continua por endereço: vizinhos de rede não se afetam
+	h := newFx(t)
+	h.user("v4@exemplo.com", users.RoleViewer)
+	for i := 0; i < 5; i++ {
+		h.login("v4@exemplo.com", "chute-chute-chute-1", "203.0.113.10")
+	}
+	if _, err := h.login("v4@exemplo.com", pw, "203.0.113.11"); err != nil {
+		t.Errorf("IPv4 vizinho não deveria ser bloqueado: %v", err)
 	}
 }
 

@@ -240,11 +240,11 @@ func NoStore(next http.Handler) http.Handler {
 	})
 }
 
-// RateLimit limita requisições por IP (token bucket em memória, por instância).
+// RateLimit limita requisições por origem: IPv4 ou rede /64 do IPv6 (token bucket em memória, por instância).
 func RateLimit(l *ratelimit.Limiter, trustProxy bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if ok, retry := l.Allow(netutil.ClientIP(r, trustProxy)); !ok {
+			if ok, retry := l.Allow(netutil.LimitKey(netutil.ClientIP(r, trustProxy))); !ok {
 				secs := int(retry.Seconds()) + 1
 				w.Header().Set("Retry-After", strconv.Itoa(secs))
 				response.Error(w, http.StatusTooManyRequests, "RATE_LIMITED", "Muitas requisições. Tente novamente em instantes.")

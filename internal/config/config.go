@@ -90,6 +90,8 @@ type Config struct {
 	AbuseIPDBMaxAgeDays int           // janela dos relatórios na pontuação
 	IPIntelCacheTTL     time.Duration // validade de cada consulta guardada
 	AbuseIPDBDailyLimit int           // consultas por dia (plano gratuito: 1000)
+	// AbuseIPDBHourlyLimit é o teto de consultas por hora, por instância (0 = 1/12 da cota diária, no mínimo 10).
+	AbuseIPDBHourlyLimit int
 
 	AutoMigrate bool
 	LogLevel    string
@@ -212,6 +214,7 @@ func Load(getenv func(string) string) (Config, error) {
 	c.AbuseIPDBMaxAgeDays = integer("ABUSEIPDB_MAX_AGE_DAYS", 90)
 	c.IPIntelCacheTTL = time.Duration(integer("IP_INTEL_CACHE_HOURS", 168)) * time.Hour
 	c.AbuseIPDBDailyLimit = integer("ABUSEIPDB_DAILY_LIMIT", 1000)
+	c.AbuseIPDBHourlyLimit = integer("ABUSEIPDB_HOURLY_LIMIT", 0)
 	for _, id := range strings.Split(getenv("TELEGRAM_ALLOWED_CHAT_IDS"), ",") {
 		if id = strings.TrimSpace(id); id != "" {
 			c.TelegramAllowedChatIDs = append(c.TelegramAllowedChatIDs, id)
@@ -257,6 +260,9 @@ func (c Config) validate() error {
 	}
 	if c.AbuseIPDBDailyLimit < 1 {
 		errs = append(errs, errors.New("ABUSEIPDB_DAILY_LIMIT deve ser >= 1"))
+	}
+	if c.AbuseIPDBHourlyLimit < 0 {
+		errs = append(errs, errors.New("ABUSEIPDB_HOURLY_LIMIT deve ser >= 0 (0 = automático)"))
 	}
 	if c.TelegramBotToken != "" && c.SecretsKey == nil {
 		errs = append(errs, errors.New("TELEGRAM_BOT_TOKEN exige SECRETS_KEY (o token é armazenado cifrado)"))

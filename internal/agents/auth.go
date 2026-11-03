@@ -55,7 +55,7 @@ func unauthorized(w http.ResponseWriter) {
 
 func (a *Auth) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip := netutil.ClientIP(r, a.TrustProxy)
+		ip := netutil.LimitKey(netutil.ClientIP(r, a.TrustProxy)) // IPv6: a rede /64 inteira conta como uma origem
 		if ok, retry := a.ByIP.Allow(ip); !ok {
 			tooMany(w, retry.Seconds())
 			return

@@ -150,7 +150,7 @@ func (r *Report) Validate(now time.Time) validation.Problems {
 		}
 		seen[pr.PID] = true
 		pr.Name = clean(pr.Name, 64)
-		pr.Cmdline = clean(pr.Cmdline, maxText)
+		pr.Cmdline = clean(RedactCmdline(clean(pr.Cmdline, maxText)), maxText) // agentes antigos mascaravam menos
 		pr.User = clean(pr.User, 48)
 		if pr.Name == "" {
 			p.Add(field("name"), "é obrigatório")

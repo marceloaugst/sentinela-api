@@ -4,6 +4,7 @@ package database_test
 
 import (
 	"context"
+	"io/fs"
 	"sync"
 	"testing"
 	"time"
@@ -39,6 +40,16 @@ func env(t *testing.T) (*database.Migrator, *pgxpool.Pool, func(string) int) {
 	return m, pool, count
 }
 
+// migrationCount é o número de migrações embutidas (arquivos *.up.sql), para o teste não ficar desatualizado a cada nova.
+func migrationCount(t *testing.T) int {
+	t.Helper()
+	files, err := fs.Glob(migrations.FS, "*.up.sql")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("migrações embutidas: %d arquivos, err=%v", len(files), err)
+	}
+	return len(files)
+}
+
 const tablesQ = `SELECT count(*) FROM information_schema.tables
 	WHERE table_schema = current_schema() AND table_name <> 'schema_migrations'`
 
@@ -46,21 +57,22 @@ func TestMigrationsUpIdempotentDown(t *testing.T) {
 	m, _, count := env(t)
 	ctx := context.Background()
 
+	want := migrationCount(t)
 	n, err := m.Up(ctx)
-	if err != nil || n != 17 {
+	if err != nil || n != want {
 		t.Fatalf("up: n=%d err=%v", n, err)
 	}
-	if got := count(tablesQ); got != 22 {
+	if got := count(tablesQ); got != 25 { // 22 + alert_silences, ip_intel e ip_intel_usage
 		t.Errorf("tabelas após up: %d", got)
 	}
 	n, err = m.Up(ctx)
 	if err != nil || n != 0 {
 		t.Errorf("segundo up deveria ser no-op: n=%d err=%v", n, err)
 	}
-	if v, _ := m.Version(ctx); v != 17 {
+	if v, _ := m.Version(ctx); v != want {
 		t.Errorf("versão %d", v)
 	}
-	if n, err := m.Down(ctx, 0); err != nil || n != 17 {
+	if n, err := m.Down(ctx, 0); err != nil || n != want {
 		t.Fatalf("down: n=%d err=%v", n, err)
 	}
 	if got := count(tablesQ); got != 0 {
@@ -88,7 +100,7 @@ func TestMigrationsConcurrentUp(t *testing.T) {
 			t.Errorf("up concorrente: %v", err)
 		}
 	}
-	if got := count("SELECT count(*) FROM schema_migrations"); got != 17 {
+	if got := count("SELECT count(*) FROM schema_migrations"); got != migrationCount(t) {
 		t.Errorf("registros em schema_migrations: %d", got)
 	}
 }
