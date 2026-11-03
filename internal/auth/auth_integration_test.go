@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -236,6 +237,47 @@ func TestIPAndEmailWideLockouts(t *testing.T) {
 	if _, err := h.login("fantasma@exemplo.com", pw, "203.0.113.9"); func() bool { _, ok := isLocked(err); return !ok }() {
 		t.Errorf("e-mail inexistente deve bloquear igual a um existente: %v", err)
 	}
+}
+
+// Requisições simultâneas não podem furar o limite: a tentativa é reservada ANTES do hash (lento) da senha.
+func TestConcurrentFailuresCannotExceedTheLockoutLimit(t *testing.T) {
+	const workers = 40
+	run := func(name string, email func(i int) string, ip func(i int) string, wantMax int, countSQL string) {
+		f := newFx(t)
+		f.user("vitima@exemplo.com", users.RoleViewer)
+		var wg sync.WaitGroup
+		var locked, invalid atomic.Int32
+		start := make(chan struct{})
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				_, err := f.login(email(i), "chute-chute-chute-1", ip(i))
+				if _, ok := isLocked(err); ok {
+					locked.Add(1)
+				} else if errors.Is(err, auth.ErrInvalidCredentials) {
+					invalid.Add(1)
+				} else {
+					t.Errorf("%s: erro inesperado: %v", name, err)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		if n := f.count(countSQL); n != wantMax {
+			t.Errorf("%s: %d tentativas gravadas; o limite é %d", name, n, wantMax)
+		}
+		if int(invalid.Load()) != wantMax || int(locked.Load()) != workers-wantMax {
+			t.Errorf("%s: %d senhas erradas e %d bloqueios; esperado %d e %d", name, invalid.Load(), locked.Load(), wantMax, workers-wantMax)
+		}
+	}
+	// par (e-mail, IP): 5
+	run("par", func(int) string { return "vitima@exemplo.com" }, func(int) string { return "203.0.113.5" }, 5, `SELECT count(*) FROM login_attempts`)
+	// origem (muitos e-mails, mesmo IP): 20
+	run("origem", func(i int) string { return fmt.Sprintf("alvo%d@exemplo.com", i) }, func(int) string { return "203.0.113.6" }, 20, `SELECT count(*) FROM login_attempts`)
+	// e-mail em IPs distintos: 30
+	run("e-mail", func(int) string { return "vitima@exemplo.com" }, func(i int) string { return fmt.Sprintf("198.51.100.%d", i+1) }, 30, `SELECT count(*) FROM login_attempts`)
 }
 
 // Quem tem um /64 de IPv6 troca de endereço a cada tentativa: os escopos por IP contam a rede /64 inteira.

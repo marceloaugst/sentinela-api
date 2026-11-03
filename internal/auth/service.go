@@ -136,11 +136,11 @@ func trunc(s string, n int) string {
 // Três escopos: (e-mail, IP) protege o usuário legítimo de um atacante em outro IP; IP contém
 // credential stuffing; e-mail global contém ataques distribuídos. Falhas anteriores a um login bem-sucedido
 // do mesmo par não contam. O "IP" dos escopos é a origem: o endereço IPv4 ou a rede /64 do IPv6 (veja ipNetwork).
-func (s *Service) lockRetry(ctx context.Context, email, ip string, now time.Time) (time.Duration, error) {
+func (s *Service) lockRetry(ctx context.Context, q rowQuerier, email, ip string, now time.Time) (time.Duration, error) {
 	start := now.Add(-s.cfg.LockWindow)
 	var pairN, ipN, emailN int
 	var pairLast, ipLast, emailLast *time.Time
-	err := s.pool.QueryRow(ctx, `SELECT
+	err := q.QueryRow(ctx, `SELECT
 		(SELECT count(*) FROM login_attempts WHERE email = $1 AND ip <<= $2::inet AND NOT succeeded
 		   AND attempted_at > GREATEST($3::timestamptz, COALESCE((SELECT max(attempted_at) FROM login_attempts
 		        WHERE email = $1 AND ip <<= $2::inet AND succeeded), '-infinity'::timestamptz))),
@@ -170,10 +170,49 @@ func (s *Service) lockRetry(ctx context.Context, email, ip string, now time.Time
 	return 0, nil
 }
 
-func (s *Service) recordAttempt(ctx context.Context, email, ip string, ok bool, now time.Time) {
-	if _, err := s.pool.Exec(ctx, `INSERT INTO login_attempts (email, ip, succeeded, attempted_at) VALUES ($1, $2::inet, $3, $4)`,
-		trunc(email, 254), ip, ok, now); err != nil {
-		s.Log.Error("falha ao registrar tentativa de login", "err", err)
+// rowQuerier é o que lockRetry precisa: satisfeito por *pgxpool.Pool e por pgx.Tx.
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// reserveAttempt confere o bloqueio e, se liberado, grava a tentativa como FALHA na mesma transação (a "reserva").
+// Sem isso, a conferência e o registro ficariam separados pelo hash da senha (lento): N requisições simultâneas
+// passariam todas pela conferência antes de qualquer falha ser gravada, e o limite de 5 viraria dezenas de tentativas.
+//
+// Duas travas consultivas serializam quem disputa os mesmos contadores: a do e-mail (escopos par e e-mail) e a da
+// rede de origem (escopo IP). A ordem é sempre a mesma (e-mail, depois origem), então não há deadlock. As travas
+// só duram esta transação curta, não o hash. Devolve o id da reserva, ou retry > 0 se estiver bloqueado (nada é gravado).
+func (s *Service) reserveAttempt(ctx context.Context, email, ip string, now time.Time) (id int64, retry time.Duration, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0)), pg_advisory_xact_lock(hashtextextended($2, 0))`,
+		"sentinela:login:email:"+email, "sentinela:login:net:"+ipNetwork(ip)); err != nil {
+		return 0, 0, err
+	}
+	if retry, err = s.lockRetry(ctx, tx, email, ip, now); err != nil || retry > 0 {
+		return 0, retry, err
+	}
+	if err = tx.QueryRow(ctx, `INSERT INTO login_attempts (email, ip, succeeded, attempted_at) VALUES ($1, $2::inet, false, $3) RETURNING id`,
+		trunc(email, 254), ip, now).Scan(&id); err != nil {
+		return 0, 0, err
+	}
+	return id, 0, tx.Commit(ctx)
+}
+
+// confirmAttempt transforma a reserva em sucesso (zera a contagem de falhas do par).
+func (s *Service) confirmAttempt(ctx context.Context, id int64) {
+	if _, err := s.pool.Exec(ctx, `UPDATE login_attempts SET succeeded = true WHERE id = $1`, id); err != nil {
+		s.Log.Error("falha ao registrar login bem-sucedido", "err", err)
+	}
+}
+
+// releaseAttempt apaga a reserva (senha certa que não deve contar nem como falha nem como sucesso de login).
+func (s *Service) releaseAttempt(ctx context.Context, id int64) {
+	if _, err := s.pool.Exec(ctx, `DELETE FROM login_attempts WHERE id = $1`, id); err != nil {
+		s.Log.Error("falha ao liberar tentativa de login", "err", err)
 	}
 }
 
@@ -216,9 +255,12 @@ func (s *Service) Login(ctx context.Context, email, password, ip, userAgent stri
 		norm = strings.ToLower(strings.TrimSpace(email))
 	}
 
-	if retry, err := s.lockRetry(ctx, norm, ip, now); err != nil {
+	// Reserva a tentativa ANTES de verificar a senha: toda saída abaixo, exceto o sucesso, já está registrada como falha.
+	attemptID, retry, err := s.reserveAttempt(ctx, norm, ip, now)
+	if err != nil {
 		return LoginResult{}, err
-	} else if retry > 0 {
+	}
+	if retry > 0 {
 		_ = audit.Write(ctx, s.pool, audit.Context{Actor: "sistema", IP: ip}, "auth.login_locked", "user", "",
 			map[string]any{"email": trunc(norm, 254), "retry_after_seconds": int(retry.Seconds())})
 		return LoginResult{}, &LockedError{RetryAfter: retry}
@@ -232,22 +274,20 @@ func (s *Service) Login(ctx context.Context, email, password, ip, userAgent stri
 		case err == nil:
 			cred, found = c, true
 		case !errors.Is(err, users.ErrNotFound):
+			s.releaseAttempt(ctx, attemptID) // erro nosso, não do usuário
 			return LoginResult{}, err
 		}
 	}
 	if !found {
 		s.Hasher.DummyVerify(ctx, password) // mesmo custo de uma verificação real
-		s.recordAttempt(ctx, norm, ip, false, now)
 		return LoginResult{}, ErrInvalidCredentials
 	}
 	ok, needsRehash, err := s.Hasher.Verify(ctx, password, cred.PasswordHash)
 	if err != nil {
 		s.Log.Error("hash de senha inválido no banco", "user_id", cred.ID, "err", err)
-		s.recordAttempt(ctx, norm, ip, false, now)
 		return LoginResult{}, ErrInvalidCredentials
 	}
 	if !ok || !cred.IsActive { // usuário desativado nunca entra, mesmo com a senha certa
-		s.recordAttempt(ctx, norm, ip, false, now)
 		return LoginResult{}, ErrInvalidCredentials
 	}
 
@@ -257,7 +297,7 @@ func (s *Service) Login(ctx context.Context, email, password, ip, userAgent stri
 			newHash = h
 		}
 	}
-	s.recordAttempt(ctx, norm, ip, true, now)
+	s.confirmAttempt(ctx, attemptID)
 	if err := s.Users.MarkLogin(ctx, cred.ID, now, newHash); err != nil {
 		return LoginResult{}, err
 	}
@@ -340,20 +380,23 @@ func (s *Service) ChangePassword(ctx context.Context, p Principal, current, newP
 	if p.Via != ViaSession {
 		return Session{}, ErrInvalidCredentials
 	}
-	if retry, err := s.lockRetry(ctx, p.Email, ip, now); err != nil {
+	attemptID, retry, err := s.reserveAttempt(ctx, p.Email, ip, now)
+	if err != nil {
 		return Session{}, err
-	} else if retry > 0 {
+	}
+	if retry > 0 {
 		return Session{}, &LockedError{RetryAfter: retry}
 	}
 	cred, err := s.Users.GetCredentials(ctx, p.UserID)
 	if err != nil {
+		s.releaseAttempt(ctx, attemptID) // falha nossa, não do usuário
 		return Session{}, err
 	}
 	ok, _, err := s.Hasher.Verify(ctx, current, cred.PasswordHash)
 	if err != nil || !ok {
-		s.recordAttempt(ctx, p.Email, ip, false, now)
-		return Session{}, ErrInvalidCredentials
+		return Session{}, ErrInvalidCredentials // a reserva fica como falha
 	}
+	s.releaseAttempt(ctx, attemptID) // senha atual correta: não conta como falha (nem como login)
 	if msgs := passwords.Validate(newPassword, cred.Email, cred.Name); len(msgs) > 0 {
 		return Session{}, &PolicyError{Messages: msgs}
 	}
