@@ -33,12 +33,70 @@ func TestRedactCmdline(t *testing.T) {
 		"app\x00DB_TOKEN=abc":                                    "app DB_TOKEN=***",
 		"psql\x00postgres://admin:s3cr3t@db:5432/x":              "psql postgres://admin:***@db:5432/x",
 		"nginx\x00-g\x00daemon off;":                             "nginx -g daemon off;",
-		"curl\x00--header=Authorization: Bearer x\x00http://a/b": "curl --header=Authorization: Bearer x http://a/b",
+		"curl\x00--header=Authorization: Bearer x\x00http://a/b": "curl --header=Authorization: Bearer *** http://a/b",
+		// cabeçalhos HTTP sensíveis
+		"curl\x00-H\x00Authorization: Bearer abc123\x00https://api": "curl -H Authorization: Bearer *** https://api",
+		"curl\x00-H\x00X-Api-Key: abc123\x00https://api":            "curl -H X-Api-Key: *** https://api",
+		"curl\x00-H\x00Cookie: sid=abc\x00https://api":              "curl -H Cookie: *** https://api",
+		"curl\x00-H\x00Accept: application/json\x00https://api":     "curl -H Accept: application/json https://api",
+		// usuário:senha
+		"curl\x00-u\x00admin:s3cr3t\x00https://api":  "curl -u admin:*** https://api",
+		"curl\x00-uadmin:s3cr3t\x00https://api":      "curl -uadmin:*** https://api",
+		"curl\x00--user=admin:s3cr3t\x00https://api": "curl --user=admin:*** https://api",
+		"curl\x00-u\x00admin\x00https://api":         "curl -u admin https://api",
+		"smbclient\x00//srv/x\x00-U\x00joao%s3cr3t":  "smbclient //srv/x -U joao%***",
+		// opções curtas de programas conhecidos
+		"mysql\x00-uroot\x00-pS3nh4\x00db":                 "mysql -uroot -p*** db",
+		"/usr/bin/mysqldump\x00-pS3nh4\x00db":              "/usr/bin/mysqldump -p*** db",
+		"mysql\x00-p\x00db":                                "mysql -p db", // -p sozinho pede a senha; "db" é o banco
+		"redis-cli\x00-h\x00r1\x00-a\x00S3nh4\x00ping":     "redis-cli -h r1 -a *** ping",
+		"sshpass\x00-pS3nh4\x00ssh\x00host":                "sshpass -p*** ssh host",
+		"sshpass\x00-p\x00S3nh4\x00ssh\x00host":            "sshpass -p *** ssh host",
+		"mongosh\x00-u\x00adm\x00-p\x00S3nh4":              "mongosh -u adm -p ***",
+		"sudo\x00-u\x00app\x00mysql\x00-pS3nh4":            "sudo -u app mysql -p***",
+		"nginx\x00-p\x00/etc/nginx":                        "nginx -p /etc/nginx", // -p de outro programa não é senha
+		"docker\x00exec\x00db\x00redis-cli\x00-a\x00S3nh4": "docker exec db redis-cli -a ***",
+		// argumento com espaços (shell)
+		"bash\x00-c\x00mysql -uroot -pS3nh4 db < x.sql":     "bash -c mysql -uroot -p*** db < x.sql",
+		"sh\x00-c\x00curl -H 'Authorization: Bearer abc' u": "sh -c curl -H 'Authorization: Bearer *** u",
+		"sh\x00-c\x00echo ok && sleep 5":                    "sh -c echo ok && sleep 5",
+		// parâmetros de URL
+		"app\x00https://x/cb?token=abc&page=2":                 "app https://x/cb?token=***&page=2",
+		"wget\x00https://s3/o?X-Amz-Signature=ff&X-Amz-Date=1": "wget https://s3/o?X-Amz-Signature=***&X-Amz-Date=1",
+		"app\x00--url=https://x/?api_key=abc":                  "app --url=https://x/?api_key=***",
 	}
 	for in, want := range cases {
 		if got := redactCmdline([]byte(in)); got != want {
 			t.Errorf("redact(%q) = %q; esperado %q", in, got, want)
 		}
+	}
+}
+
+// A API mascara de novo o que o agente envia (texto já unido por espaços), cobrindo agentes antigos.
+func TestRedactCmdlineJoined(t *testing.T) {
+	cases := map[string]string{
+		"mysql -uroot -pS3nh4 db":                        "mysql -uroot -p*** db",
+		"curl -H Authorization: Bearer abc123 https://a": "curl -H Authorization: Bearer *** https://a",
+		"curl -H X-Api-Key: abc https://a":               "curl -H X-Api-Key: *** https://a",
+		"redis-cli -a S3nh4 ping":                        "redis-cli -a *** ping",
+		"app --password=*** --port=80":                   "app --password=*** --port=80", // já mascarado: idempotente
+		"nginx: worker  process":                         "nginx: worker  process",       // sem segredo: texto original intacto
+	}
+	for in, want := range cases {
+		if got := RedactCmdline(in); got != want {
+			t.Errorf("RedactCmdline(%q) = %q; esperado %q", in, got, want)
+		}
+	}
+}
+
+func TestReportValidateRedactsCmdline(t *testing.T) {
+	r := goodReport(time.Now())
+	r.Processes[0].Cmdline = "mysql -uroot -pS3nh4 db"
+	if p := r.Validate(time.Now()); len(p) > 0 {
+		t.Fatalf("problemas: %v", p)
+	}
+	if got := r.Processes[0].Cmdline; strings.Contains(got, "S3nh4") {
+		t.Errorf("senha não mascarada na API: %q", got)
 	}
 }
 

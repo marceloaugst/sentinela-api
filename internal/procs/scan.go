@@ -4,7 +4,6 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -331,35 +330,6 @@ func serviceKeyForUnit(unit string) string {
 		}
 	}
 	return ""
-}
-
-var (
-	secretKeyRe  = regexp.MustCompile(`(?i)(pass(word|wd)?|secret|token|api[-_]?key|apikey|auth|credential|private[-_]?key)`)
-	userinfoRe   = regexp.MustCompile(`(://[^/\s:@]+:)[^/\s@]+@`)
-	flagOrAssign = regexp.MustCompile(`^(-{0,2}[A-Za-z0-9_.-]+)=(.*)$`)
-)
-
-// redactCmdline junta os argumentos (separados por NUL) mascarando o que parece segredo: "--password=x", "TOKEN=x",
-// o argumento seguinte a "--password" e senhas em URLs (user:senha@host). É heurístico: reduz o vazamento, não o garante.
-func redactCmdline(b []byte) string {
-	args := strings.Split(strings.TrimRight(string(b), "\x00"), "\x00")
-	out := make([]string, 0, len(args))
-	maskNext := false
-	for _, a := range args {
-		switch {
-		case maskNext:
-			a, maskNext = "***", false
-		default:
-			if m := flagOrAssign.FindStringSubmatch(a); m != nil && secretKeyRe.MatchString(m[1]) {
-				a = m[1] + "=***"
-			} else if strings.HasPrefix(a, "-") && secretKeyRe.MatchString(a) && !strings.Contains(a, "=") {
-				maskNext = true
-			}
-			a = userinfoRe.ReplaceAllString(a, "${1}***@")
-		}
-		out = append(out, a)
-	}
-	return strings.Join(out, " ")
 }
 
 func itoa(i int) string { return strconv.Itoa(i) }
