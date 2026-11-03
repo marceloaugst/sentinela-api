@@ -28,7 +28,7 @@ GET /logs, /logs/stats, /logs/countries
         └─ API: para os IPs da resposta consulta o cache (PostgreSQL, tabela ip_intel)
                  ├─ IP em cache e válido ──────────────► usa
                  ├─ IP novo/vencido ──► AbuseIPDB (até 20 por requisição, 4 s) ──► grava no cache
-                 └─ IP privado/loopback ───────────────► { private: true }, sem consulta
+                 └─ IP não público (privado, loopback, CGNAT...) ─► { private: true }, sem consulta
 ```
 
 Pontos que afetam o frontend:
@@ -36,7 +36,7 @@ Pontos que afetam o frontend:
 - **Nada muda nas rotas existentes**: `geo` é um campo **novo e opcional**. Telas que não o conhecem continuam funcionando.
 - A consulta ao AbuseIPDB acontece **na leitura**, não na ingestão do log. IPs que ninguém abriu no painel não gastam cota.
 - O AbuseIPDB informa o **país** (código ISO), provedor e pontuação de abuso. **Não há latitude/longitude**: para mapa de pontos seria preciso outra fonte; para mapa coroplético (países coloridos) o código do país basta.
-- O cache vale `IP_INTEL_CACHE_HOURS` (padrão 7 dias). A cota diária é `ABUSEIPDB_DAILY_LIMIT` (padrão 1000, plano gratuito).
+- O cache vale `IP_INTEL_CACHE_HOURS` (padrão 7 dias). A cota diária é `ABUSEIPDB_DAILY_LIMIT` (padrão 1000, plano gratuito) e há um teto por hora (`ABUSEIPDB_HOURLY_LIMIT`, padrão 1/12 da cota diária): com o teto atingido, IPs novos ficam sem `geo` por um tempo, como em qualquer IP "ainda não consultado".
 - Sem `ABUSEIPDB_API_KEY` na API, só aparece o que já estava em cache (no começo, nada).
 
 ---
@@ -46,7 +46,7 @@ Pontos que afetam o frontend:
 ```ts
 // logs/geo-types.ts
 export interface IPGeo {
-  private?: boolean;            // IP de rede interna/loopback: nenhum outro campo vem
+  private?: boolean;            // IP não público (rede interna, loopback, CGNAT, faixa reservada): nenhum outro campo vem
   country_code?: string;        // ISO 3166-1 alfa-2, ex.: "CN"
   isp?: string;
   usage_type?: string;          // ex.: "Data Center/Web Hosting/Transit"
@@ -229,7 +229,7 @@ A API **não filtra logs por país** (o país não está no ClickHouse). Para "v
 
 ## 6. Dados que chegam aos poucos
 
-A API consulta o AbuseIPDB de forma **gradual**: no máximo **20 IPs novos por requisição** (e 4 s de rede). Consequências:
+A API consulta o AbuseIPDB de forma **gradual**: no máximo **20 IPs novos por requisição** (e 4 s de rede) e um teto por hora no total. Consequências:
 
 - Na **primeira** abertura de uma lista com muitos IPs novos, parte dos itens vem **sem `geo`**. Isso significa *"ainda não consultado"*, não *"sem dados"*.
 - Na **próxima** requisição (recarga, paginação, polling) os IPs seguintes são preenchidos. IPs já consultados vêm instantaneamente do cache.

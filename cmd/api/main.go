@@ -187,6 +187,7 @@ func run(args []string) error {
 	// Geolocalização/reputação de IPs (AbuseIPDB). Sem chave, só serve o que já está no cache.
 	ipIntel := ipintel.NewService(pool, &ipintel.Client{Key: cfg.AbuseIPDBKey, MaxAge: cfg.AbuseIPDBMaxAgeDays},
 		cfg.IPIntelCacheTTL, cfg.AbuseIPDBDailyLimit, log)
+	ipIntel.HourlyLimit = cfg.AbuseIPDBHourlyLimit
 	if cfg.AbuseIPDBKey == "" {
 		log.Info("AbuseIPDB sem chave (ABUSEIPDB_API_KEY): logs sem novas consultas de geolocalização")
 	}
