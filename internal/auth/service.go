@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"sentinela/internal/audit"
+	"sentinela/internal/netutil"
 	"sentinela/internal/passwords"
 	"sentinela/internal/users"
 	"sentinela/internal/validation"
@@ -113,6 +114,15 @@ func cleanIP(ip string) string {
 	return "0.0.0.0"
 }
 
+// ipNetwork devolve a rede de origem do IP para o bloqueio de login: o próprio endereço IPv4 (/32) ou o /64 do IPv6.
+// Quem tem um /64 troca de endereço à vontade; contar por endereço deixaria os escopos por IP sem efeito.
+func ipNetwork(ip string) string {
+	if p := netutil.Network(ip); p.IsValid() {
+		return p.String()
+	}
+	return "0.0.0.0/32"
+}
+
 func trunc(s string, n int) string {
 	if len(s) > n {
 		return s[:n]
@@ -125,21 +135,21 @@ func trunc(s string, n int) string {
 // lockRetry devolve por quanto tempo o login está bloqueado para esta combinação (0 = liberado).
 // Três escopos: (e-mail, IP) protege o usuário legítimo de um atacante em outro IP; IP contém
 // credential stuffing; e-mail global contém ataques distribuídos. Falhas anteriores a um login bem-sucedido
-// do mesmo par não contam.
+// do mesmo par não contam. O "IP" dos escopos é a origem: o endereço IPv4 ou a rede /64 do IPv6 (veja ipNetwork).
 func (s *Service) lockRetry(ctx context.Context, email, ip string, now time.Time) (time.Duration, error) {
 	start := now.Add(-s.cfg.LockWindow)
 	var pairN, ipN, emailN int
 	var pairLast, ipLast, emailLast *time.Time
 	err := s.pool.QueryRow(ctx, `SELECT
-		(SELECT count(*) FROM login_attempts WHERE email = $1 AND ip = $2::inet AND NOT succeeded
+		(SELECT count(*) FROM login_attempts WHERE email = $1 AND ip <<= $2::inet AND NOT succeeded
 		   AND attempted_at > GREATEST($3::timestamptz, COALESCE((SELECT max(attempted_at) FROM login_attempts
-		        WHERE email = $1 AND ip = $2::inet AND succeeded), '-infinity'::timestamptz))),
-		(SELECT max(attempted_at) FROM login_attempts WHERE email = $1 AND ip = $2::inet AND NOT succeeded AND attempted_at > $3),
-		(SELECT count(*) FROM login_attempts WHERE ip = $2::inet AND NOT succeeded AND attempted_at > $3),
-		(SELECT max(attempted_at) FROM login_attempts WHERE ip = $2::inet AND NOT succeeded AND attempted_at > $3),
+		        WHERE email = $1 AND ip <<= $2::inet AND succeeded), '-infinity'::timestamptz))),
+		(SELECT max(attempted_at) FROM login_attempts WHERE email = $1 AND ip <<= $2::inet AND NOT succeeded AND attempted_at > $3),
+		(SELECT count(*) FROM login_attempts WHERE ip <<= $2::inet AND NOT succeeded AND attempted_at > $3),
+		(SELECT max(attempted_at) FROM login_attempts WHERE ip <<= $2::inet AND NOT succeeded AND attempted_at > $3),
 		(SELECT count(*) FROM login_attempts WHERE email = $1 AND NOT succeeded AND attempted_at > $3),
 		(SELECT max(attempted_at) FROM login_attempts WHERE email = $1 AND NOT succeeded AND attempted_at > $3)`,
-		email, ip, start).Scan(&pairN, &pairLast, &ipN, &ipLast, &emailN, &emailLast)
+		email, ipNetwork(ip), start).Scan(&pairN, &pairLast, &ipN, &ipLast, &emailN, &emailLast)
 	if err != nil {
 		return 0, err
 	}

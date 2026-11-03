@@ -238,6 +238,45 @@ func TestIPAndEmailWideLockouts(t *testing.T) {
 	}
 }
 
+// Quem tem um /64 de IPv6 troca de endereço a cada tentativa: os escopos por IP contam a rede /64 inteira.
+func TestIPv6LockoutsCountTheWhole64(t *testing.T) {
+	// par (e-mail, origem): 5 falhas, cada uma de um endereço diferente do mesmo /64
+	f := newFx(t)
+	f.user("vitima@exemplo.com", users.RoleViewer)
+	for i := 0; i < 5; i++ {
+		f.login("vitima@exemplo.com", "chute-chute-chute-1", fmt.Sprintf("2001:db8:aa:1:%x::%x", i+1, i+7))
+	}
+	if _, err := f.login("vitima@exemplo.com", pw, "2001:db8:aa:1:ffff::1"); func() bool { _, ok := isLocked(err); return !ok }() {
+		t.Errorf("5 falhas no mesmo /64 deveriam bloquear o par: %v", err)
+	}
+	if _, err := f.login("vitima@exemplo.com", pw, "2001:db8:aa:2::1"); err != nil {
+		t.Errorf("outro /64 não é afetado: %v", err)
+	}
+	if n := f.count(`SELECT count(DISTINCT ip) FROM login_attempts WHERE NOT succeeded`); n != 5 {
+		t.Errorf("cada tentativa guarda o endereço exato (auditoria): %d endereços distintos", n)
+	}
+
+	// origem: credential stuffing girando endereços dentro do /64
+	g := newFx(t)
+	g.user("real@exemplo.com", users.RoleViewer)
+	for i := 0; i < 20; i++ {
+		g.login(fmt.Sprintf("alvo%d@exemplo.com", i), "chute-chute-chute-1", fmt.Sprintf("2001:db8:bb:1::%x", i+1))
+	}
+	if _, err := g.login("real@exemplo.com", pw, "2001:db8:bb:1::beef"); func() bool { _, ok := isLocked(err); return !ok }() {
+		t.Errorf("20 falhas no mesmo /64 deveriam bloquear a origem: %v", err)
+	}
+
+	// IPv4 continua por endereço: vizinhos de rede não se afetam
+	h := newFx(t)
+	h.user("v4@exemplo.com", users.RoleViewer)
+	for i := 0; i < 5; i++ {
+		h.login("v4@exemplo.com", "chute-chute-chute-1", "203.0.113.10")
+	}
+	if _, err := h.login("v4@exemplo.com", pw, "203.0.113.11"); err != nil {
+		t.Errorf("IPv4 vizinho não deveria ser bloqueado: %v", err)
+	}
+}
+
 func TestSessionExpiryIdleSlidingAbsoluteRevocationAndDeactivation(t *testing.T) {
 	f := newFx(t)
 	u := f.user("ana@exemplo.com", users.RoleOperator)

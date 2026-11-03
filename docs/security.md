@@ -38,10 +38,10 @@ Resumo do modelo de ameaças, das decisões e dos controles. O que está aqui co
 ## 3. Força bruta e abuso
 | Controle | Detalhe |
 |---|---|
-| Bloqueio de login (429 `LOGIN_LOCKED`, `Retry-After`) | 5 falhas do mesmo e-mail **a partir do mesmo IP**; 20 falhas de um IP (credential stuffing); 30 falhas do mesmo e-mail em IPs distintos — janela/bloqueio de 15 min, que se desfaz sozinho. Verificado **antes** de checar a senha; tentativas bloqueadas não prolongam o bloqueio. |
+| Bloqueio de login (429 `LOGIN_LOCKED`, `Retry-After`) | 5 falhas do mesmo e-mail **a partir do mesmo IP**; 20 falhas de um IP (credential stuffing); 30 falhas do mesmo e-mail em IPs distintos — janela/bloqueio de 15 min, que se desfaz sozinho. Verificado **antes** de checar a senha; tentativas bloqueadas não prolongam o bloqueio. "IP" aqui é a **origem**: o endereço IPv4 ou a **rede /64** do IPv6 (quem tem um /64 troca de endereço à vontade); cada tentativa guarda o endereço exato. |
 | Sem DoS de conta | O escopo (e-mail, IP) impede que um atacante em outro IP tranque o usuário legítimo (testado). O bloqueio global por e-mail (30) é o compromisso contra ataques distribuídos. |
 | Sem enumeração de contas | Senha errada, e-mail inexistente, conta desativada e e-mail malformado: **mesma resposta e mesmo tempo** (hash fantasma; teste de tempo). |
-| Limite de taxa | Login 5 req/s por IP (burst 10); API 30 req/s por IP (burst 100); agentes 2 req/s por credencial e 20/s por IP. Em memória, **por instância**. No Nginx há uma segunda camada. |
+| Limite de taxa | Login 5 req/s por IP (burst 10); API 30 req/s por IP (burst 100); agentes 2 req/s por credencial e 20/s por IP; conexões SSE por IP. Em todos, IPv6 conta pela rede /64. Em memória, **por instância**. No Nginx há uma segunda camada (`limit_req` por endereço; com IPv6 ela é contornável girando endereços no /64, por isso o limite que vale é o da API). |
 | Troca de senha | Exige a senha atual; erros contam para o bloqueio. |
 | Limites | Corpo 1 MiB (login 8 KiB, agentes 64 KiB), senha ≤ 1 KiB, timeouts HTTP, JSON estrito (campos desconhecidos recusados). |
 
