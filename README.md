@@ -28,7 +28,7 @@ Documentação detalhada: [arquitetura](docs/architecture.md) · [API](docs/api.
 ### Requisitos
 - Linux com **Docker** e o plugin **docker compose**.
 - Para publicar com HTTPS: **Nginx** (e um domínio, se quiser Let's Encrypt).
-- Go 1.26+ só se for compilar ou desenvolver localmente.
+- Go 1.27+ só se for compilar ou desenvolver localmente.
 
 ### Opção A — um comando, em um servidor com IP (HTTPS autoassinado)
 ```bash
