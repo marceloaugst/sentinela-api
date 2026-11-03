@@ -57,16 +57,20 @@ func TestSilencesAPI(t *testing.T) {
 
 	// validação
 	for name, b := range map[string]map[string]any{
-		"sem motivo":         {"duration_minutes": 10},
-		"sem fim":            {"reason": "x"},
-		"servidor inexiste":  {"reason": "x", "duration_minutes": 10, "server_id": "11111111-1111-1111-1111-111111111111"},
-		"regra inexistente":  {"reason": "x", "duration_minutes": 10, "rule_id": "11111111-1111-1111-1111-111111111111"},
-		"muito longa":        {"reason": "x", "duration_minutes": 60 * 24 * 31},
-		"campo desconhecido": {"reason": "x", "duration_minutes": 10, "foo": 1},
+		"sem motivo":        {"duration_minutes": 10},
+		"sem fim":           {"reason": "x"},
+		"servidor inexiste": {"reason": "x", "duration_minutes": 10, "server_id": "11111111-1111-1111-1111-111111111111"},
+		"regra inexistente": {"reason": "x", "duration_minutes": 10, "rule_id": "11111111-1111-1111-1111-111111111111"},
+		"muito longa":       {"reason": "x", "duration_minutes": 60 * 24 * 31},
 	} {
 		if r := operator.do("POST", "/api/v1/silences", b); r.Status != 422 {
 			t.Errorf("%s: %d %s", name, r.Status, r.Raw)
 		}
+	}
+
+	// campo desconhecido é recusado como JSON inválido (400), como no resto da API
+	if r := operator.do("POST", "/api/v1/silences", map[string]any{"reason": "x", "duration_minutes": 10, "foo": 1}); r.Status != 400 {
+		t.Errorf("campo desconhecido: %d %s", r.Status, r.Raw)
 	}
 
 	// cancelar é idempotente e some dos ativos
